@@ -19,6 +19,7 @@ class HybridTtsController {
   private audioEl: HTMLAudioElement | null = null;
   private playbackCtx: AudioContext | null = null;
   private activeSources: AudioBufferSourceNode[] = [];
+  private activeAbortController: AbortController | null = null;
   private audioCache = new Map<string, string>();
   private segmentTimerIds: number[] = [];
   private activeRunId = 0;
@@ -57,6 +58,10 @@ class HybridTtsController {
 
   public stop(): void {
     this.activeRunId += 1;
+    if (this.activeAbortController) {
+      this.activeAbortController.abort();
+      this.activeAbortController = null;
+    }
     for (const tid of this.segmentTimerIds) {
       window.clearTimeout(tid);
     }
@@ -203,7 +208,9 @@ class HybridTtsController {
     };
 
     try {
-      for await (const chunk of streamGeminiTtsChunks(ttsParams)) {
+      const abortCtrl = new AbortController();
+      this.activeAbortController = abortCtrl;
+      for await (const chunk of streamGeminiTtsChunks({ ...ttsParams, signal: abortCtrl.signal })) {
         if (runId !== this.activeRunId) return true;
         sampleRate = chunk.sampleRate || 24000;
         rawChunksForCache.push(chunk.pcmBytes);

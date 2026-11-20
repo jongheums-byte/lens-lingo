@@ -50,6 +50,7 @@ interface CameraHudViewProps {
     textQuestion?: string;
     demoSceneId?: DemoSceneId;
   }) => Promise<void>;
+  onCancelTurn: () => void;
   onReplayTutorMessage: (msg: ChatMessage) => void;
   onStopTts: () => void;
   onUnlockAudio: () => void;
@@ -76,6 +77,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
   onClearError,
   onUpdateSettings,
   onSubmitTurn,
+  onCancelTurn,
   onReplayTutorMessage,
   onStopTts,
   onUnlockAudio,
@@ -105,6 +107,20 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
   const [textDraft, setTextDraft] = useState('');
   const [showLangPicker, setShowLangPicker] = useState(false);
   const [showPersonaPicker, setShowPersonaPicker] = useState(false);
+  const [elapsedSec, setElapsedSec] = useState<number>(0);
+
+  useEffect(() => {
+    if (!isProcessing) {
+      setElapsedSec(0);
+      return;
+    }
+    const start = Date.now();
+    setElapsedSec(0);
+    const tid = window.setInterval(() => {
+      setElapsedSec((Date.now() - start) / 1000);
+    }, 250);
+    return () => window.clearInterval(tid);
+  }, [isProcessing]);
 
   const currentLang = TARGET_LANGUAGES[settings.targetLanguage];
   const currentPersona = PERSONAS[settings.persona];
@@ -511,6 +527,37 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
             );
           })}
 
+        {!settings.demoMode && (
+          <button
+            type="button"
+            className="glass-pill"
+            onClick={() =>
+              onUpdateSettings({
+                ...settings,
+                tutorModel:
+                  settings.tutorModel === 'gemini-3.5-flash-lite'
+                    ? 'gemini-3.8-flash'
+                    : 'gemini-3.5-flash-lite',
+              })
+            }
+            style={{
+              padding: '4px 10px',
+              fontSize: '11.5px',
+              flexShrink: 0,
+              background:
+                settings.tutorModel === 'gemini-3.5-flash-lite'
+                  ? 'rgba(56, 189, 248, 0.2)'
+                  : 'rgba(167, 139, 250, 0.2)',
+              borderColor:
+                settings.tutorModel === 'gemini-3.5-flash-lite'
+                  ? 'rgba(56, 189, 248, 0.5)'
+                  : 'rgba(167, 139, 250, 0.5)',
+            }}
+          >
+            {settings.tutorModel === 'gemini-3.5-flash-lite' ? '⚡ 3.5 Lite' : '🎯 3.8 Flash'}
+          </button>
+        )}
+
         {!cameraDenied && (
           <button
             type="button"
@@ -766,7 +813,9 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
 
             <div style={{ fontSize: '14.5px', lineHeight: 1.58, fontWeight: 500 }}>
               {isProcessing && !latestTutorMsg.text ? (
-                <span style={{ color: '#BAE6FD' }}>👀 장면을 살펴보는 중...</span>
+                <span style={{ color: '#BAE6FD' }}>
+                  👀 장면을 살펴보는 중... ({elapsedSec.toFixed(1)}초)
+                </span>
               ) : (
                 <>
                   {(latestTutorMsg.segments && latestTutorMsg.segments.length > 0
@@ -800,29 +849,48 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
                   whiteSpace: 'nowrap',
                 }}
               >
-                {latestTutorMsg.translationSummary}
+                {isProcessing
+                  ? `${settings.tutorModel === 'gemini-3.5-flash-lite' ? '⚡ 3.5 Lite' : '🎯 3.8 Flash'} 분석 중`
+                  : latestTutorMsg.translationSummary}
               </span>
 
-              <button
-                type="button"
-                className="glass-pill"
-                onClick={() => {
-                  onUnlockAudio();
-                  if (ttsState !== 'idle') onStopTts();
-                  else onReplayTutorMessage(latestTutorMsg);
-                }}
-                style={{ padding: '5px 10px', fontSize: '11.5px', flexShrink: 0 }}
-              >
-                {ttsState === 'playing' || ttsState === 'loading' ? (
-                  <>
-                    <VolumeX size={13} color="#FB7185" /> 정지
-                  </>
-                ) : (
-                  <>
-                    <Volume2 size={13} color="#38BDF8" /> 다시 듣기
-                  </>
-                )}
-              </button>
+              {isProcessing ? (
+                <button
+                  type="button"
+                  className="glass-pill"
+                  onClick={onCancelTurn}
+                  style={{
+                    padding: '5px 10px',
+                    fontSize: '11.5px',
+                    flexShrink: 0,
+                    borderColor: 'rgba(251, 113, 133, 0.5)',
+                    color: '#FECDD3',
+                  }}
+                >
+                  <X size={13} color="#FB7185" /> 취소
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="glass-pill"
+                  onClick={() => {
+                    onUnlockAudio();
+                    if (ttsState !== 'idle') onStopTts();
+                    else onReplayTutorMessage(latestTutorMsg);
+                  }}
+                  style={{ padding: '5px 10px', fontSize: '11.5px', flexShrink: 0 }}
+                >
+                  {ttsState === 'playing' || ttsState === 'loading' ? (
+                    <>
+                      <VolumeX size={13} color="#FB7185" /> 정지
+                    </>
+                  ) : (
+                    <>
+                      <Volume2 size={13} color="#38BDF8" /> 다시 듣기
+                    </>
+                  )}
+                </button>
+              )}
             </div>
           </div>
         ) : (
@@ -1122,18 +1190,19 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
             <button
               type="button"
               className="glass-pill"
-              onClick={handleQuickScan}
-              disabled={isProcessing || isRecording}
+              onClick={isProcessing ? onCancelTurn : handleQuickScan}
+              disabled={isRecording}
               style={{
                 padding: '8px 10px',
                 gap: '4px',
                 fontSize: '12px',
                 whiteSpace: 'nowrap',
-                background: 'rgba(15, 23, 42, 0.85)',
+                background: isProcessing ? 'rgba(159, 18, 57, 0.78)' : 'rgba(15, 23, 42, 0.85)',
+                borderColor: isProcessing ? 'rgba(251, 113, 133, 0.55)' : undefined,
               }}
             >
-              <Camera size={14} color="#38BDF8" />
-              <span>{isProcessing ? '분석' : '스캔'}</span>
+              {isProcessing ? <X size={14} color="#FECDD3" /> : <Camera size={14} color="#38BDF8" />}
+              <span>{isProcessing ? '취소' : '스캔'}</span>
             </button>
 
             <button

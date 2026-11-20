@@ -84,6 +84,7 @@ export const App: React.FC = () => {
   const [ttsEngine, setTtsEngine] = useState<TtsEngineKind>('browser');
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(-1);
   const turnSeqRef = useRef(0);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const [editingCard, setEditingCard] = useState<SavedVocabCard | null>(null);
   const [showHistory, setShowHistory] = useState(false);
@@ -151,6 +152,27 @@ export const App: React.FC = () => {
     [],
   );
 
+  const handleCancelTurn = useCallback(() => {
+    turnSeqRef.current += 1;
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    ttsController.stop();
+    setIsProcessing(false);
+    setIsExtractingCards(false);
+    setActiveSession((prev) => {
+      const last = prev.messages[prev.messages.length - 1];
+      if (last && last.role === 'tutor' && !last.text) {
+        return {
+          ...prev,
+          messages: prev.messages.slice(0, -2),
+        };
+      }
+      return prev;
+    });
+  }, []);
+
   const handleSubmitTurn = async (params: {
     imageDataUrl: string;
     audioBase64?: string;
@@ -158,6 +180,12 @@ export const App: React.FC = () => {
     textQuestion?: string;
     demoSceneId?: DemoSceneId;
   }) => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const turnAbortController = new AbortController();
+    abortControllerRef.current = turnAbortController;
+
     const turnSeq = ++turnSeqRef.current;
     setIsProcessing(true);
     setIsExtractingCards(false);
@@ -316,6 +344,7 @@ export const App: React.FC = () => {
         audioMimeType: params.audioMimeType,
         textQuestion: params.textQuestion,
         previousInteractionId: baseSession.previousInteractionId,
+        signal: turnAbortController.signal,
         onPartial: (partial) => {
           if (turnSeq !== turnSeqRef.current) return;
           upsertTurnMessages(
@@ -374,6 +403,7 @@ export const App: React.FC = () => {
         replyText: streamRes.plainText,
         imageBase64: imgParts.base64,
         imageMimeType: imgParts.mimeType,
+        signal: turnAbortController.signal,
       });
 
       const newCards: SavedVocabCard[] = await Promise.all(
@@ -429,6 +459,9 @@ export const App: React.FC = () => {
       await putSession(finalSession);
       setSessions((prev) => [finalSession, ...prev.filter((s) => s.id !== finalSession.id)]);
     } catch (err) {
+      if (turnAbortController.signal.aborted) {
+        return;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       setErrorBanner(`튜터 호출 오류: ${msg}`);
       // Roll back empty placeholder if Pass 1 failed completely
@@ -526,6 +559,7 @@ export const App: React.FC = () => {
             onClearError={() => setErrorBanner(null)}
             onUpdateSettings={handleUpdateSettings}
             onSubmitTurn={handleSubmitTurn}
+            onCancelTurn={handleCancelTurn}
             onReplayTutorMessage={(msg) => playTutorSegments(msg, settings)}
             onStopTts={() => {
               ttsController.stop();

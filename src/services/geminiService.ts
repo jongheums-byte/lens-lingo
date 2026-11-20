@@ -1,7 +1,14 @@
-import { GoogleGenAI } from '@google/genai';
 import { PROFICIENCY_LEVELS, TARGET_LANGUAGES } from '../config/languages';
 import { PERSONAS } from '../config/personas';
 import { base64ToUint8Array } from '../lib/audioUtils';
+import {
+  extractAudioFromInteractionObject,
+  extractCompletedFallbackText,
+  extractEventAudioDelta,
+  extractEventTextDelta,
+  extractTextFromInteractionObject,
+  parseSseBuffer,
+} from '../lib/sseParser';
 import {
   parseStreamingReply,
   parseTutorResponse,
@@ -19,6 +26,8 @@ import type {
   TutorResponsePayload,
 } from '../types/app';
 
+const INTERACTIONS_ENDPOINT = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+
 export interface AskTutorParams {
   settings: AppSettings;
   imageBase64?: string;
@@ -27,6 +36,7 @@ export interface AskTutorParams {
   audioMimeType?: string;
   textQuestion?: string;
   previousInteractionId?: string;
+  signal?: AbortSignal;
 }
 
 export interface AskTutorResult {
@@ -43,60 +53,132 @@ export interface StreamTutorResult {
   totalMs: number;
 }
 
-function createClient(apiKey: string): GoogleGenAI {
-  return new GoogleGenAI({
-    apiKey: apiKey.trim(),
-    httpOptions: { apiVersion: 'v1beta' },
-  });
+export class GeminiHttpError extends Error {
+  public readonly status: number;
+  public readonly detail: string;
+
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.name = 'GeminiHttpError';
+    this.status = status;
+    this.detail = detail;
+  }
 }
 
 export function getFastThinkingLevel(model: TutorModelId): 'minimal' | 'low' {
   return model === 'gemini-3.5-flash-lite' ? 'minimal' : 'low';
 }
 
-function getErrorStatusCode(err: unknown): number | undefined {
-  if (!err || typeof err !== 'object') return undefined;
-  const obj = err as Record<string, unknown>;
-  if (typeof obj.statusCode === 'number') return obj.statusCode;
-  if (typeof obj.status === 'number') return obj.status;
-  return undefined;
+function extractApiErrorDetail(status: number, rawBody: string): string {
+  let detail = '';
+  if (rawBody.trim()) {
+    try {
+      const parsed = JSON.parse(rawBody) as unknown;
+      const first = Array.isArray(parsed) ? parsed[0] : parsed;
+      if (first && typeof first === 'object') {
+        const obj = first as Record<string, unknown>;
+        const nested = obj.error as Record<string, unknown> | undefined;
+        detail =
+          (typeof nested?.message === 'string' && nested.message) ||
+          (typeof obj.message === 'string' && obj.message) ||
+          '';
+      }
+    } catch {
+      detail = rawBody.slice(0, 180);
+    }
+  }
+
+  if (status === 429) {
+    return `무료 요청 한도 초과(429): 잠시 후 다시 시도하거나 설정에서 모델을 변경해 주세요.${detail ? ` (${detail})` : ''}`;
+  }
+  if (status === 401 || status === 403) {
+    return `API 키 인증 오류(${status}): 설정에서 Gemini API 키를 확인해 주세요.${detail ? ` (${detail})` : ''}`;
+  }
+  if (status === 503 || status === 500) {
+    return `Google AI 서버 일시 혼잡(${status}): 잠시 후 다시 시도해 주세요.`;
+  }
+  return `[HTTP ${status}] ${detail || '요청 처리 중 오류가 발생했습니다.'}`;
 }
 
 export function formatGeminiError(err: unknown): string {
   console.error('[LensLingo Gemini Error]', err);
-  if (err && typeof err === 'object') {
-    const obj = err as Record<string, unknown>;
-    const status = getErrorStatusCode(err);
-    const prefix = status ? `[HTTP ${status}] ` : '';
-
-    if (typeof obj.body === 'string' && obj.body.trim()) {
-      try {
-        const parsed = JSON.parse(obj.body) as Record<string, unknown>;
-        const nestedErr = parsed.error as Record<string, unknown> | undefined;
-        const bodyMsg =
-          (typeof nestedErr?.message === 'string' && nestedErr.message) ||
-          (typeof parsed.message === 'string' && parsed.message);
-        if (bodyMsg) return `${prefix}${bodyMsg}`;
-      } catch {
-        return `${prefix}${obj.body.slice(0, 220)}`;
-      }
-    }
-
-    if (obj.error && typeof obj.error === 'object') {
-      const e1 = obj.error as Record<string, unknown>;
-      const e2 =
-        e1.error && typeof e1.error === 'object' ? (e1.error as Record<string, unknown>) : undefined;
-      const errMsg =
-        (typeof e2?.message === 'string' && e2.message) ||
-        (typeof e1.message === 'string' && e1.message);
-      if (errMsg) return `${prefix}${errMsg}`;
-    }
-
-    if (typeof obj.message === 'string' && obj.message) {
-      return `${prefix}${obj.message}`;
-    }
+  if (err instanceof GeminiHttpError) {
+    return err.detail;
+  }
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return '요청 시간이 초과되었거나 취소되었습니다.';
   }
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Links an optional external AbortSignal with a hard timeout AbortController.
+ */
+function createTimedController(timeoutMs: number, externalSignal?: AbortSignal): {
+  controller: AbortController;
+  didTimeout: () => boolean;
+  clear: () => void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort();
+    } else {
+      externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
+
+  const timerId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    controller,
+    didTimeout: () => timedOut,
+    clear: () => {
+      window.clearTimeout(timerId);
+      externalSignal?.removeEventListener('abort', onExternalAbort);
+    },
+  };
+}
+
+async function fetchInteractionJson(
+  apiKey: string,
+  body: Record<string, unknown>,
+  options: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<Record<string, unknown>> {
+  const { timeoutMs = 12000, signal } = options;
+  const timed = createTimedController(timeoutMs, signal);
+
+  try {
+    const res = await fetch(INTERACTIONS_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey.trim(),
+      },
+      body: JSON.stringify(body),
+      signal: timed.controller.signal,
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new GeminiHttpError(res.status, extractApiErrorDetail(res.status, text));
+    }
+
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch (err) {
+    if (timed.didTimeout()) {
+      throw new Error(`응답 시간 초과 (${Math.round(timeoutMs / 1000)}초) — 네트워크 상태를 확인하고 다시 시도해 주세요.`);
+    }
+    throw err;
+  } finally {
+    timed.clear();
+  }
 }
 
 function buildSystemInstruction(settings: AppSettings): string {
@@ -148,21 +230,31 @@ Fast Real-Time Tutoring Rules:
 }
 
 /**
- * Pass 1 (Fast Streaming): Streams natural Korean + <t>target</t> reply immediately
- * using minimal/low thinking and low-res image prefill so text and audio begin in ~1s.
+ * Pass 1 (Fast Streaming with Hard Timeout & Non-Streaming Fallback):
+ * Uses direct native fetch + ReadableStream.getReader() so mobile browsers never hang in SDK retries.
  */
 export async function streamTutorReply(
   params: AskTutorParams & {
     onPartial: (partial: ParsedStreamReply) => void;
   },
 ): Promise<StreamTutorResult> {
-  const { settings, imageBase64, imageMimeType = 'image/jpeg', audioBase64, audioMimeType = 'audio/wav', textQuestion, previousInteractionId, onPartial } = params;
+  const {
+    settings,
+    imageBase64,
+    imageMimeType = 'image/jpeg',
+    audioBase64,
+    audioMimeType = 'audio/wav',
+    textQuestion,
+    previousInteractionId,
+    signal,
+    onPartial,
+  } = params;
+
   if (!settings.apiKey.trim()) {
     throw new Error('Gemini API 키가 설정되지 않았습니다.');
   }
 
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
-  const client = createClient(settings.apiKey);
   const startMs = performance.now();
 
   const promptText = audioBase64
@@ -173,7 +265,12 @@ export async function streamTutorReply(
 
   type InputBlock =
     | { type: 'text'; text: string }
-    | { type: 'image'; data: string; mime_type: 'image/jpeg' | 'image/png' | 'image/webp'; resolution?: 'low' | 'medium' | 'high' }
+    | {
+        type: 'image';
+        data: string;
+        mime_type: 'image/jpeg' | 'image/png' | 'image/webp';
+        resolution?: 'low' | 'medium' | 'high';
+      }
     | { type: 'audio'; data: string; mime_type: string };
 
   const inputBlocks: InputBlock[] = [{ type: 'text', text: promptText }];
@@ -193,68 +290,217 @@ export async function streamTutorReply(
     });
   }
 
-  const executeStream = async (prevId?: string): Promise<StreamTutorResult> => {
-    const stream = await client.interactions.create({
-      model: settings.tutorModel,
-      system_instruction: buildStreamingSystemInstruction(settings, Boolean(audioBase64)),
-      ...(prevId ? { previous_interaction_id: prevId } : {}),
-      input: inputBlocks,
-      generation_config: {
-        thinking_level: getFastThinkingLevel(settings.tutorModel),
-      },
-      stream: true,
+  const makePayload = (prevId: string | undefined, stream: boolean): Record<string, unknown> => ({
+    model: settings.tutorModel,
+    system_instruction: buildStreamingSystemInstruction(settings, Boolean(audioBase64)),
+    ...(prevId ? { previous_interaction_id: prevId } : {}),
+    input: inputBlocks,
+    generation_config: {
+      thinking_level: getFastThinkingLevel(settings.tutorModel),
+    },
+    stream,
+  });
+
+  const fallbackTranscript =
+    textQuestion?.trim() || (audioBase64 ? '🎙️ 음성 질문' : '📸 이거 뭐예요?');
+
+  const runUnaryFallback = async (prevId?: string): Promise<StreamTutorResult> => {
+    const data = await fetchInteractionJson(settings.apiKey, makePayload(prevId, false), {
+      timeoutMs: 12000,
+      signal,
     });
-
-    let accumulated = '';
-    let ttftMs = 0;
-    let completedId: string | undefined;
-    let latestParsed: ParsedStreamReply = { segments: [], plainText: '' };
-
-    for await (const event of stream) {
-      if (event.event_type === 'error') {
-        const msg = event.error?.message || 'Gemini stream error';
-        throw new Error(msg);
-      }
-      if (event.event_type === 'step.delta' && event.delta.type === 'text' && event.delta.text) {
-        if (ttftMs === 0) {
-          ttftMs = Math.round(performance.now() - startMs);
-        }
-        accumulated += event.delta.text;
-        latestParsed = parseStreamingReply(accumulated);
-        onPartial(latestParsed);
-      } else if (event.event_type === 'interaction.completed') {
-        completedId = event.interaction?.id;
-      }
-    }
-
-    const totalMs = Math.round(performance.now() - startMs);
-    if (!latestParsed.plainText.trim()) {
+    const rawText = extractTextFromInteractionObject(data);
+    if (!rawText.trim()) {
       throw new Error('튜터 응답이 비어 있습니다.');
     }
-
+    const parsed = parseStreamingReply(rawText);
+    onPartial(parsed);
+    const totalMs = Math.round(performance.now() - startMs);
     return {
-      userTranscript:
-        latestParsed.userTranscript ||
-        textQuestion?.trim() ||
-        (audioBase64 ? '🎙️ 음성 질문' : '📸 이거 뭐예요?'),
+      userTranscript: parsed.userTranscript || fallbackTranscript,
       segments:
-        latestParsed.segments.length > 0
-          ? latestParsed.segments
-          : [{ text: latestParsed.plainText, isTarget: false }],
-      plainText: latestParsed.plainText,
-      interactionId: completedId,
-      ttftMs: ttftMs || totalMs,
+        parsed.segments.length > 0
+          ? parsed.segments
+          : [{ text: parsed.plainText || rawText, isTarget: false }],
+      plainText: parsed.plainText || rawText,
+      interactionId: typeof data.id === 'string' ? data.id : undefined,
+      ttftMs: totalMs,
       totalMs,
     };
   };
 
+  const runSse = async (prevId?: string): Promise<StreamTutorResult> => {
+    // 10s hard deadline to receive first text token; reset/extended once tokens flow
+    let timed = createTimedController(10000, signal);
+    let gotFirstToken = false;
+
+    try {
+      const res = await fetch(INTERACTIONS_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          'x-goog-api-key': settings.apiKey.trim(),
+        },
+        body: JSON.stringify(makePayload(prevId, true)),
+        signal: timed.controller.signal,
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new GeminiHttpError(res.status, extractApiErrorDetail(res.status, errText));
+      }
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.body || contentType.includes('application/json')) {
+        const jsonText = await res.text();
+        const data = JSON.parse(jsonText) as Record<string, unknown>;
+        const rawText = extractTextFromInteractionObject(data);
+        const parsed = parseStreamingReply(rawText);
+        onPartial(parsed);
+        const totalMs = Math.round(performance.now() - startMs);
+        return {
+          userTranscript: parsed.userTranscript || fallbackTranscript,
+          segments:
+            parsed.segments.length > 0
+              ? parsed.segments
+              : [{ text: parsed.plainText || rawText, isTarget: false }],
+          plainText: parsed.plainText || rawText,
+          interactionId: typeof data.id === 'string' ? data.id : undefined,
+          ttftMs: totalMs,
+          totalMs,
+        };
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let sseBuffer = '';
+      let accumulated = '';
+      let ttftMs = 0;
+      let completedId: string | undefined;
+      let latestParsed: ParsedStreamReply = { segments: [], plainText: '' };
+
+      const processFrameData = (rawData: string): boolean => {
+        if (rawData === '[DONE]') return true;
+        let ev: Record<string, unknown>;
+        try {
+          ev = JSON.parse(rawData) as Record<string, unknown>;
+        } catch {
+          return false;
+        }
+
+        if (ev.event_type === 'error') {
+          const errObj = ev.error as Record<string, unknown> | undefined;
+          throw new Error(
+            (typeof errObj?.message === 'string' && errObj.message) || 'Gemini 스트리밍 오류',
+          );
+        }
+
+        const deltaText = extractEventTextDelta(ev);
+        if (deltaText) {
+          if (!gotFirstToken) {
+            gotFirstToken = true;
+            ttftMs = Math.round(performance.now() - startMs);
+            // Extend remaining stream timeout once first token arrives
+            timed.clear();
+            timed = createTimedController(15000, signal);
+          }
+          accumulated += deltaText;
+          latestParsed = parseStreamingReply(accumulated);
+          onPartial(latestParsed);
+        }
+
+        if (ev.event_type === 'interaction.completed') {
+          const interaction = ev.interaction as Record<string, unknown> | undefined;
+          if (typeof interaction?.id === 'string') {
+            completedId = interaction.id;
+          }
+          if (!accumulated.trim()) {
+            const fallbackText = extractCompletedFallbackText(ev);
+            if (fallbackText) {
+              accumulated = fallbackText;
+              latestParsed = parseStreamingReply(accumulated);
+              onPartial(latestParsed);
+            }
+          }
+        }
+        return false;
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          const finalText = decoder.decode();
+          if (finalText) sseBuffer += finalText;
+          if (sseBuffer.trim()) {
+            const { events } = parseSseBuffer(sseBuffer + '\n\n');
+            for (const e of events) processFrameData(e.data);
+          }
+          break;
+        }
+
+        sseBuffer += decoder.decode(value, { stream: true });
+        const { events, remainder } = parseSseBuffer(sseBuffer);
+        sseBuffer = remainder;
+
+        let sawDone = false;
+        for (const e of events) {
+          if (processFrameData(e.data)) {
+            sawDone = true;
+            break;
+          }
+        }
+        if (sawDone) {
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
+      }
+
+      const totalMs = Math.round(performance.now() - startMs);
+      if (!latestParsed.plainText.trim()) {
+        throw new Error('튜터 응답이 비어 있습니다.');
+      }
+
+      return {
+        userTranscript: latestParsed.userTranscript || fallbackTranscript,
+        segments:
+          latestParsed.segments.length > 0
+            ? latestParsed.segments
+            : [{ text: latestParsed.plainText, isTarget: false }],
+        plainText: latestParsed.plainText,
+        interactionId: completedId,
+        ttftMs: ttftMs || totalMs,
+        totalMs,
+      };
+    } catch (err) {
+      // If user explicitly cancelled, rethrow AbortError cleanly
+      if (signal?.aborted) {
+        throw err;
+      }
+      // If SSE timed out before receiving a single token (e.g. mobile proxy buffering SSE),
+      // automatically fall back to a clean unary request once.
+      if (timed.didTimeout() && !gotFirstToken) {
+        return runUnaryFallback(prevId);
+      }
+      throw err;
+    } finally {
+      timed.clear();
+    }
+  };
+
   try {
-    return await executeStream(previousInteractionId?.trim() || undefined);
+    return await runSse(previousInteractionId?.trim() || undefined);
   } catch (err) {
-    const status = getErrorStatusCode(err);
-    if (previousInteractionId?.trim() && (status === 400 || status === 404)) {
+    if (signal?.aborted) {
+      throw err;
+    }
+    if (
+      previousInteractionId?.trim() &&
+      err instanceof GeminiHttpError &&
+      (err.status === 400 || err.status === 404)
+    ) {
       try {
-        return await executeStream(undefined);
+        return await runSse(undefined);
       } catch (retryErr) {
         throw new Error(formatGeminiError(retryErr));
       }
@@ -272,18 +518,23 @@ export async function extractVocabCardsAsync(params: {
   replyText: string;
   imageBase64?: string;
   imageMimeType?: 'image/jpeg' | 'image/png' | 'image/webp';
+  signal?: AbortSignal;
 }): Promise<{ translationSummary: string; vocabCards: ExtractedVocab[] }> {
-  const { settings, replyText, imageBase64, imageMimeType = 'image/jpeg' } = params;
+  const { settings, replyText, imageBase64, imageMimeType = 'image/jpeg', signal } = params;
   if (!settings.apiKey.trim()) {
     return { translationSummary: '', vocabCards: [] };
   }
 
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
-  const client = createClient(settings.apiKey);
 
   type InputBlock =
     | { type: 'text'; text: string }
-    | { type: 'image'; data: string; mime_type: 'image/jpeg' | 'image/png' | 'image/webp'; resolution?: 'low' | 'medium' | 'high' };
+    | {
+        type: 'image';
+        data: string;
+        mime_type: 'image/jpeg' | 'image/png' | 'image/webp';
+        resolution?: 'low' | 'medium' | 'high';
+      };
 
   const inputBlocks: InputBlock[] = [
     {
@@ -302,21 +553,25 @@ export async function extractVocabCardsAsync(params: {
   }
 
   try {
-    const interaction = await client.interactions.create({
-      model: 'gemini-3.5-flash-lite',
-      input: inputBlocks,
-      store: false,
-      response_format: {
-        type: 'text',
-        mime_type: 'application/json',
-        schema: VOCAB_CARDS_ONLY_JSON_SCHEMA,
+    const data = await fetchInteractionJson(
+      settings.apiKey,
+      {
+        model: 'gemini-3.5-flash-lite',
+        input: inputBlocks,
+        store: false,
+        response_format: {
+          type: 'text',
+          mime_type: 'application/json',
+          schema: VOCAB_CARDS_ONLY_JSON_SCHEMA,
+        },
+        generation_config: {
+          thinking_level: 'minimal',
+        },
       },
-      generation_config: {
-        thinking_level: 'minimal',
-      },
-    });
+      { timeoutMs: 12000, signal },
+    );
 
-    const rawText = interaction.output_text ?? '';
+    const rawText = extractTextFromInteractionObject(data);
     if (!rawText) return { translationSummary: '', vocabCards: [] };
     return parseVocabCardsOnly(rawText);
   } catch (err) {
@@ -333,13 +588,13 @@ export async function askTutor({
   audioMimeType = 'audio/wav',
   textQuestion,
   previousInteractionId,
+  signal,
 }: AskTutorParams): Promise<AskTutorResult> {
   if (!settings.apiKey.trim()) {
     throw new Error('Gemini API 키가 설정되지 않았습니다.');
   }
 
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
-  const client = createClient(settings.apiKey);
 
   const promptText = audioBase64
     ? `Listen to the student's spoken question (which may mix Korean and ${lang.englishName}) about this scene, answer concisely as the tutor, and extract 1-3 vocabulary cards with bounding boxes.`
@@ -347,21 +602,15 @@ export async function askTutor({
       ? `Student question: "${textQuestion.trim()}". Answer concisely as the tutor based on the scene and extract 1-3 vocabulary cards with bounding boxes.`
       : `Identify the main focal object, menu item, or sign in this image. Teach its ${lang.englishName} name, natural pronunciation, and one quick practical phrase for using it in real life.`;
 
-  type InputBlock =
-    | { type: 'text'; text: string }
-    | { type: 'image'; data: string; mime_type: 'image/jpeg' | 'image/png' | 'image/webp' }
-    | { type: 'audio'; data: string; mime_type: string };
-
-  const inputBlocks: InputBlock[] = [{ type: 'text', text: promptText }];
-
+  const inputBlocks: Record<string, unknown>[] = [{ type: 'text', text: promptText }];
   if (imageBase64) {
     inputBlocks.push({
       type: 'image',
       data: imageBase64,
       mime_type: imageMimeType,
+      resolution: 'low',
     });
   }
-
   if (audioBase64) {
     inputBlocks.push({
       type: 'audio',
@@ -371,38 +620,41 @@ export async function askTutor({
   }
 
   const runCreate = (prevId?: string) =>
-    client.interactions.create({
-      model: settings.tutorModel,
-      system_instruction: buildSystemInstruction(settings),
-      ...(prevId ? { previous_interaction_id: prevId } : {}),
-      input: inputBlocks,
-      response_format: {
-        type: 'text',
-        mime_type: 'application/json',
-        schema: TUTOR_RESPONSE_JSON_SCHEMA,
+    fetchInteractionJson(
+      settings.apiKey,
+      {
+        model: settings.tutorModel,
+        system_instruction: buildSystemInstruction(settings),
+        ...(prevId ? { previous_interaction_id: prevId } : {}),
+        input: inputBlocks,
+        response_format: {
+          type: 'text',
+          mime_type: 'application/json',
+          schema: TUTOR_RESPONSE_JSON_SCHEMA,
+        },
+        generation_config: {
+          thinking_level: getFastThinkingLevel(settings.tutorModel),
+        },
       },
-      generation_config: {
-        thinking_level: getFastThinkingLevel(settings.tutorModel),
-      },
-    });
+      { timeoutMs: 14000, signal },
+    );
 
-  let interaction;
+  let data: Record<string, unknown>;
   try {
-    interaction = await runCreate(previousInteractionId?.trim() || undefined);
+    data = await runCreate(previousInteractionId?.trim() || undefined);
   } catch (err) {
-    const status = getErrorStatusCode(err);
-    if (previousInteractionId?.trim() && (status === 400 || status === 404)) {
-      try {
-        interaction = await runCreate(undefined);
-      } catch (retryErr) {
-        throw new Error(formatGeminiError(retryErr));
-      }
+    if (
+      previousInteractionId?.trim() &&
+      err instanceof GeminiHttpError &&
+      (err.status === 400 || err.status === 404)
+    ) {
+      data = await runCreate(undefined);
     } else {
       throw new Error(formatGeminiError(err));
     }
   }
 
-  const rawText = interaction.output_text ?? '';
+  const rawText = extractTextFromInteractionObject(data);
   if (!rawText) {
     throw new Error('튜터 응답이 비어 있습니다.');
   }
@@ -414,60 +666,115 @@ export async function askTutor({
 
   return {
     payload,
-    interactionId: interaction.id,
+    interactionId: typeof data.id === 'string' ? data.id : undefined,
   };
 }
 
 /**
- * Streams raw 16-bit signed LE mono PCM audio chunks (default 24kHz) as Gemini synthesizes them.
+ * Streams raw 16-bit signed LE mono PCM audio chunks (default 24kHz) directly via native fetch
+ * with an 8-second first-chunk timeout so TTS never hangs silently.
  */
 export async function* streamGeminiTtsChunks(params: {
   apiKey: string;
   text: string;
   persona: PersonaId;
   expressive?: boolean;
+  signal?: AbortSignal;
 }): AsyncGenerator<{ pcmBytes: Uint8Array; sampleRate: number }> {
-  const client = createClient(params.apiKey);
   const personaCfg = PERSONAS[params.persona];
   const model = params.expressive ? 'gemini-3.8-flash-tts' : 'gemini-3.8-flash-lite-tts';
+  let timed = createTimedController(8000, params.signal);
+  let gotFirstChunk = false;
 
-  const stream = await client.interactions.create({
-    model,
-    input: [
-      {
-        type: 'user_input',
-        content: [
+  try {
+    const res = await fetch(INTERACTIONS_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+        'x-goog-api-key': params.apiKey.trim(),
+      },
+      body: JSON.stringify({
+        model,
+        input: [
           {
-            type: 'text',
-            text: params.text,
-            annotations: [
+            type: 'user_input',
+            content: [
               {
-                type: 'speech_metadata',
-                style: personaCfg.ttsStyle,
+                type: 'text',
+                text: params.text,
+                annotations: [
+                  {
+                    type: 'speech_metadata',
+                    style: personaCfg.ttsStyle,
+                  },
+                ],
               },
             ],
           },
         ],
-      },
-    ],
-    response_format: { type: 'audio' },
-    generation_config: {
-      speech_config: [{ voice: personaCfg.geminiVoice }],
-    },
-    stream: true,
-  });
+        response_format: { type: 'audio' },
+        generation_config: {
+          speech_config: [{ voice: personaCfg.geminiVoice }],
+        },
+        stream: true,
+      }),
+      signal: timed.controller.signal,
+    });
 
-  for await (const event of stream) {
-    if (event.event_type === 'error') {
-      throw new Error(event.error?.message || 'Gemini TTS stream error');
+    if (!res.ok || !res.body) {
+      const errText = await res.text().catch(() => '');
+      throw new GeminiHttpError(res.status, extractApiErrorDetail(res.status, errText));
     }
-    if (event.event_type === 'step.delta' && event.delta.type === 'audio' && event.delta.data) {
-      const pcmBytes = base64ToUint8Array(event.delta.data);
-      const sampleRate = event.delta.sample_rate || 24000;
-      if (pcmBytes.byteLength > 0) {
-        yield { pcmBytes, sampleRate };
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let sseBuffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        const finalText = decoder.decode();
+        if (finalText) sseBuffer += finalText;
+        break;
+      }
+
+      sseBuffer += decoder.decode(value, { stream: true });
+      const { events, remainder } = parseSseBuffer(sseBuffer);
+      sseBuffer = remainder;
+
+      for (const e of events) {
+        if (e.data === '[DONE]') {
+          await reader.cancel().catch(() => undefined);
+          return;
+        }
+        let ev: Record<string, unknown>;
+        try {
+          ev = JSON.parse(e.data) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+
+        if (ev.event_type === 'error') {
+          throw new Error('Gemini TTS stream error');
+        }
+
+        const audioDelta = extractEventAudioDelta(ev);
+        if (audioDelta) {
+          if (!gotFirstChunk) {
+            gotFirstChunk = true;
+            timed.clear();
+            timed = createTimedController(15000, params.signal);
+          }
+          const pcmBytes = base64ToUint8Array(audioDelta.data);
+          if (pcmBytes.byteLength > 0) {
+            yield { pcmBytes, sampleRate: audioDelta.sampleRate };
+          }
+        }
       }
     }
+  } finally {
+    timed.clear();
   }
 }
 
@@ -477,47 +784,49 @@ export async function synthesizeGeminiTts(params: {
   persona: PersonaId;
   expressive?: boolean;
 }): Promise<Blob> {
-  const client = createClient(params.apiKey);
   const personaCfg = PERSONAS[params.persona];
   const model = params.expressive ? 'gemini-3.8-flash-tts' : 'gemini-3.8-flash-lite-tts';
 
-  const interaction = await client.interactions.create({
-    model,
-    input: [
-      {
-        type: 'user_input',
-        content: [
-          {
-            type: 'text',
-            text: params.text,
-            annotations: [
-              {
-                type: 'speech_metadata',
-                style: personaCfg.ttsStyle,
-              },
-            ],
-          },
-        ],
+  const data = await fetchInteractionJson(
+    params.apiKey,
+    {
+      model,
+      input: [
+        {
+          type: 'user_input',
+          content: [
+            {
+              type: 'text',
+              text: params.text,
+              annotations: [
+                {
+                  type: 'speech_metadata',
+                  style: personaCfg.ttsStyle,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      response_format: { type: 'audio' },
+      generation_config: {
+        speech_config: [{ voice: personaCfg.geminiVoice }],
       },
-    ],
-    response_format: { type: 'audio' },
-    generation_config: {
-      speech_config: [{ voice: personaCfg.geminiVoice }],
     },
-  });
+    { timeoutMs: 12000 },
+  );
 
-  const audioData = interaction.output_audio?.data;
-  if (!audioData) {
+  const audioObj = extractAudioFromInteractionObject(data);
+  if (!audioObj) {
     throw new Error('Gemini TTS audio payload missing');
   }
 
-  const mimeType = interaction.output_audio?.mime_type || 'audio/wav';
-  const bytes = base64ToUint8Array(audioData);
+  const bytes = base64ToUint8Array(audioObj.data);
   const arrayBuffer = bytes.buffer.slice(
     bytes.byteOffset,
     bytes.byteOffset + bytes.byteLength,
   ) as ArrayBuffer;
-  return new Blob([arrayBuffer], { type: mimeType });
+  return new Blob([arrayBuffer], { type: audioObj.mimeType });
 }
 
 export async function verifyGeminiApiKey(apiKey: string): Promise<{ ok: boolean; message: string }> {
@@ -525,17 +834,21 @@ export async function verifyGeminiApiKey(apiKey: string): Promise<{ ok: boolean;
     return { ok: false, message: 'API 키를 입력해 주세요.' };
   }
   try {
-    const client = createClient(apiKey);
-    const interaction = await client.interactions.create({
-      model: 'gemini-3.5-flash-lite',
-      input: 'Reply with OK.',
-      store: false,
-      generation_config: {
-        thinking_level: 'minimal',
+    const data = await fetchInteractionJson(
+      apiKey,
+      {
+        model: 'gemini-3.5-flash-lite',
+        input: 'Reply with OK.',
+        store: false,
+        generation_config: {
+          thinking_level: 'minimal',
+        },
       },
-    });
-    if (interaction.output_text || interaction.id) {
-      return { ok: true, message: '연결 성공! Gemini 3.8 / 3.5 초고속 튜터를 사용할 수 있습니다.' };
+      { timeoutMs: 8000 },
+    );
+    const out = extractTextFromInteractionObject(data);
+    if (out || data.id) {
+      return { ok: true, message: '연결 성공! Gemini 초고속 튜터를 사용할 수 있습니다.' };
     }
     return { ok: false, message: '응답을 받지 못했습니다.' };
   } catch (err) {

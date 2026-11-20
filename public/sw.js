@@ -1,4 +1,4 @@
-const CACHE_NAME = 'lens-lingo-shell-v2';
+const CACHE_NAME = 'lens-lingo-shell-v3';
 const APP_SHELL_URLS = [
   './',
   './index.html',
@@ -36,7 +36,7 @@ self.addEventListener('fetch', (event) => {
 
   if (request.mode === 'navigate') {
     event.respondWith(
-      fetch(request)
+      fetch(request, { cache: 'no-cache' })
         .then((response) => {
           const clone = response.clone();
           caches.open(CACHE_NAME).then((cache) => cache.put('./index.html', clone));
