@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B1020" />
+      <stop offset="55%" stop-color="#172554" />
+      <stop offset="100%" stop-color="#0F172A" />
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="50%" stop-color="#818CF8" />
+      <stop offset="100%" stop-color="#34D399" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="120" fill="url(#bg)" />
+  <path d="M108 176V128C108 117 117 108 128 108H176" fill="none" stroke="url(#ring)" stroke-width="24" stroke-linecap="round" />
+  <path d="M336 108H384C395 108 404 117 404 128V176" fill="none" stroke="url(#ring)" stroke-width="24" stroke-linecap="round" />
+  <path d="M108 336V384C108 395 117 404 128 404H176" fill="none" stroke="url(#ring)" stroke-width="24" stroke-linecap="round" />
+  <path d="M336 404H384C395 404 404 395 404 384V336" fill="none" stroke="url(#ring)" stroke-width="24" stroke-linecap="round" />
+  <circle cx="256" cy="248" r="88" fill="none" stroke="url(#ring)" stroke-width="22" />
+  <circle cx="256" cy="248" r="42" fill="#38BDF8" fill-opacity="0.22" stroke="#E0F2FE" stroke-width="10" />
+  <path d="M326 164L336 184L356 194L336 204L326 224L316 204L296 194L316 184Z" fill="#34D399" />
+</svg>
