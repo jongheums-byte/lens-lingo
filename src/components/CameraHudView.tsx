@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { LANGUAGE_LIST, LEVEL_LIST, TARGET_LANGUAGES } from '../config/languages';
 import { PERSONA_LIST, PERSONAS } from '../config/personas';
-import { blobTo16kWavBase64, playSfx } from '../lib/audioUtils';
+import { playSfx, prepareAudioForGemini } from '../lib/audioUtils';
 import { DEMO_SCENES, renderDemoSceneDataUrl, type DemoSceneId } from '../services/demoService';
 import type { TtsPlaybackState } from '../services/ttsService';
 import type {
@@ -39,6 +39,7 @@ interface CameraHudViewProps {
   ttsEngine: TtsEngineKind;
   activeSegmentIndex: number;
   isProcessing: boolean;
+  isExtractingCards: boolean;
   errorBanner: string | null;
   onClearError: () => void;
   onUpdateSettings: (next: AppSettings) => void;
@@ -70,6 +71,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
   ttsEngine,
   activeSegmentIndex,
   isProcessing,
+  isExtractingCards,
   errorBanner,
   onClearError,
   onUpdateSettings,
@@ -182,7 +184,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
 
     if (cameraReady && videoRef.current && videoRef.current.videoWidth > 0) {
       const vid = videoRef.current;
-      const maxDim = 960;
+      const maxDim = 640;
       const ratio = Math.min(1, maxDim / Math.max(vid.videoWidth, vid.videoHeight));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(vid.videoWidth * ratio);
@@ -190,7 +192,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        return canvas.toDataURL('image/jpeg', 0.85);
+        return canvas.toDataURL('image/jpeg', 0.72);
       }
     }
 
@@ -263,7 +265,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
         setFrozenFrameUrl(imgUrl);
 
         try {
-          const { base64, mimeType } = await blobTo16kWavBase64(blob);
+          const { base64, mimeType } = await prepareAudioForGemini(blob);
           await onSubmitTurn({
             imageDataUrl: imgUrl,
             audioBase64: base64,
@@ -295,7 +297,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
     reader.onload = () => {
       const img = new Image();
       img.onload = async () => {
-        const maxDim = 960;
+        const maxDim = 640;
         const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
         const canvas = document.createElement('canvas');
         canvas.width = Math.round(img.width * scale);
@@ -303,7 +305,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
         const ctx = canvas.getContext('2d');
         if (!ctx) return;
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const compressedUrl = canvas.toDataURL('image/jpeg', 0.85);
+        const compressedUrl = canvas.toDataURL('image/jpeg', 0.72);
         setFrozenFrameUrl(compressedUrl);
         onUnlockAudio();
         await onSubmitTurn({ imageDataUrl: compressedUrl });
@@ -639,6 +641,55 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
               );
             })}
           </div>
+          <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-secondary)' }}>
+            응답 속도 / AI 모델
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateSettings({ ...settings, tutorModel: 'gemini-3.5-flash-lite' })
+              }
+              style={{
+                padding: '8px',
+                borderRadius: '10px',
+                fontSize: '12px',
+                fontWeight: 700,
+                background:
+                  settings.tutorModel === 'gemini-3.5-flash-lite'
+                    ? 'rgba(56, 189, 248, 0.24)'
+                    : 'rgba(255,255,255,0.05)',
+                border:
+                  settings.tutorModel === 'gemini-3.5-flash-lite'
+                    ? '1px solid #38BDF8'
+                    : '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              ⚡ 초고속 3.5 Lite
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateSettings({ ...settings, tutorModel: 'gemini-3.8-flash' })
+              }
+              style={{
+                padding: '8px',
+                borderRadius: '10px',
+                fontSize: '12px',
+                fontWeight: 700,
+                background:
+                  settings.tutorModel === 'gemini-3.8-flash'
+                    ? 'rgba(167, 139, 250, 0.24)'
+                    : 'rgba(255,255,255,0.05)',
+                border:
+                  settings.tutorModel === 'gemini-3.8-flash'
+                    ? '1px solid #A78BFA'
+                    : '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              🎯 고정확 3.8 Flash
+            </button>
+          </div>
         </div>
       )}
 
@@ -695,37 +746,48 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
             }}
           >
             {latestUserMsg && (
-              <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between' }}>
+              <div style={{ fontSize: '11.5px', color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   나: {latestUserMsg.text}
                 </span>
                 <span style={{ flexShrink: 0, color: '#BAE6FD', marginLeft: '8px' }}>
                   {ttsState === 'playing'
                     ? ttsEngine === 'gemini'
-                      ? 'Gemini AI 음성'
+                      ? 'Gemini 실시간 음성'
                       : '브라우저 음성'
-                    : ''}
+                    : ttsState === 'loading'
+                      ? '음성 준비중...'
+                      : latestTutorMsg.latencyMs
+                        ? `⚡ ${(latestTutorMsg.latencyMs / 1000).toFixed(1)}s`
+                        : ''}
                 </span>
               </div>
             )}
 
             <div style={{ fontSize: '14.5px', lineHeight: 1.58, fontWeight: 500 }}>
-              {(latestTutorMsg.segments && latestTutorMsg.segments.length > 0
-                ? latestTutorMsg.segments
-                : [{ text: latestTutorMsg.text, isTarget: false }]
-              ).map((seg, idx) => {
-                const isActive = ttsState === 'playing' && activeSegmentIndex === idx;
-                return (
-                  <span
-                    key={idx}
-                    className={`${seg.isTarget ? 'seg-target' : 'seg-native'} ${isActive ? 'active' : ''}`}
-                    onClick={seg.isTarget ? () => onSpeakWord(seg.text) : undefined}
-                    style={{ cursor: seg.isTarget ? 'pointer' : undefined }}
-                  >
-                    {seg.text}
-                  </span>
-                );
-              })}
+              {isProcessing && !latestTutorMsg.text ? (
+                <span style={{ color: '#BAE6FD' }}>👀 장면을 살펴보는 중...</span>
+              ) : (
+                <>
+                  {(latestTutorMsg.segments && latestTutorMsg.segments.length > 0
+                    ? latestTutorMsg.segments
+                    : [{ text: latestTutorMsg.text, isTarget: false }]
+                  ).map((seg, idx) => {
+                    const isActive = ttsState === 'playing' && activeSegmentIndex === idx;
+                    return (
+                      <span
+                        key={idx}
+                        className={`${seg.isTarget ? 'seg-target' : 'seg-native'} ${isActive ? 'active' : ''}`}
+                        onClick={seg.isTarget ? () => onSpeakWord(seg.text) : undefined}
+                        style={{ cursor: seg.isTarget ? 'pointer' : undefined }}
+                      >
+                        {seg.text}
+                      </span>
+                    );
+                  })}
+                  {isProcessing && <span className="stream-cursor" />}
+                </>
+              )}
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
@@ -787,8 +849,8 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
           </div>
         )}
 
-        {/* Horizontal Sticker Vocab Tray */}
-        {recentTrayCards.length > 0 && (
+        {/* Horizontal Sticker Vocab Tray (or Shimmer Placeholders while Pass 2 extracts cards) */}
+        {(recentTrayCards.length > 0 || isExtractingCards) && (
           <div
             className="no-scrollbar"
             style={{
@@ -798,6 +860,52 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
               padding: '2px 2px',
             }}
           >
+            {isExtractingCards &&
+              recentTrayCards.length === 0 &&
+              [0, 1].map((idx) => (
+                <div
+                  key={`shimmer-${idx}`}
+                  className="glass-panel shimmer-card"
+                  style={{
+                    flexShrink: 0,
+                    width: '200px',
+                    height: '74px',
+                    borderRadius: '18px',
+                    padding: '9px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '10px',
+                  }}
+                >
+                  <div
+                    style={{
+                      width: '52px',
+                      height: '52px',
+                      borderRadius: '14px',
+                      background: 'rgba(255,255,255,0.12)',
+                      flexShrink: 0,
+                    }}
+                  />
+                  <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <div
+                      style={{
+                        height: '12px',
+                        width: '72%',
+                        borderRadius: '6px',
+                        background: 'rgba(255,255,255,0.16)',
+                      }}
+                    />
+                    <div
+                      style={{
+                        height: '10px',
+                        width: '52%',
+                        borderRadius: '5px',
+                        background: 'rgba(56,189,248,0.2)',
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
             {recentTrayCards.map((card) => {
               const isSaved = savedIdSet.has(card.id);
               return (

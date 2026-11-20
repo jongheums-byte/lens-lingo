@@ -66,6 +66,7 @@ export interface ChatMessage {
   translationSummary?: string;
   vocabCardIds?: string[];
   extractedCards?: ExtractedVocab[];
+  latencyMs?: number;
 }
 
 export interface LearningSession {

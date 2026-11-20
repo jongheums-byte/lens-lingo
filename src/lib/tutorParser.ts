@@ -64,6 +64,18 @@ export const TUTOR_RESPONSE_JSON_SCHEMA = {
   required: ['userTranscript', 'replySegments', 'translationSummary', 'vocabCards'],
 } as const;
 
+export const VOCAB_CARDS_ONLY_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    translationSummary: {
+      type: 'string',
+      description: 'Concise 1-line Korean summary of the key expression taught.',
+    },
+    vocabCards: TUTOR_RESPONSE_JSON_SCHEMA.properties.vocabCards,
+  },
+  required: ['translationSummary', 'vocabCards'],
+} as const;
+
 function sanitizeBox2d(raw: unknown): Box2D | undefined {
   if (!Array.isArray(raw) || raw.length !== 4) return undefined;
   const nums = raw.map((n) => Number(n));
@@ -93,6 +105,30 @@ function extractJsonObjectText(raw: string): string {
   return trimmed;
 }
 
+function parseVocabCardList(rawCards: unknown): ExtractedVocab[] {
+  if (!Array.isArray(rawCards)) return [];
+  return rawCards
+    .map((card): ExtractedVocab | null => {
+      if (!card || typeof card !== 'object') return null;
+      const obj = card as Record<string, unknown>;
+      const word = stripByteFallback(String(obj.word ?? ''));
+      const meaning = stripByteFallback(String(obj.meaning ?? ''));
+      if (!word || !meaning) return null;
+      return {
+        word,
+        reading: stripByteFallback(String(obj.reading ?? word)),
+        koreanPronunciation: stripByteFallback(String(obj.koreanPronunciation ?? '')),
+        meaning,
+        partOfSpeech: stripByteFallback(String(obj.partOfSpeech ?? '표현')),
+        exampleTarget: stripByteFallback(String(obj.exampleTarget ?? word)),
+        exampleKorean: stripByteFallback(String(obj.exampleKorean ?? meaning)),
+        box2d: sanitizeBox2d(obj.box2d),
+      };
+    })
+    .filter((c): c is ExtractedVocab => c !== null)
+    .slice(0, 4);
+}
+
 export function parseTutorResponse(rawText: string, fallbackQuestion = ''): TutorResponsePayload {
   const jsonText = extractJsonObjectText(rawText);
   const parsed = JSON.parse(jsonText) as Record<string, unknown>;
@@ -118,32 +154,95 @@ export function parseTutorResponse(rawText: string, fallbackQuestion = ''): Tuto
     });
   }
 
-  const rawCards = Array.isArray(parsed.vocabCards) ? parsed.vocabCards : [];
-  const vocabCards: ExtractedVocab[] = rawCards
-    .map((card): ExtractedVocab | null => {
-      if (!card || typeof card !== 'object') return null;
-      const obj = card as Record<string, unknown>;
-      const word = stripByteFallback(String(obj.word ?? ''));
-      const meaning = stripByteFallback(String(obj.meaning ?? ''));
-      if (!word || !meaning) return null;
-      return {
-        word,
-        reading: stripByteFallback(String(obj.reading ?? word)),
-        koreanPronunciation: stripByteFallback(String(obj.koreanPronunciation ?? '')),
-        meaning,
-        partOfSpeech: stripByteFallback(String(obj.partOfSpeech ?? '표현')),
-        exampleTarget: stripByteFallback(String(obj.exampleTarget ?? word)),
-        exampleKorean: stripByteFallback(String(obj.exampleKorean ?? meaning)),
-        box2d: sanitizeBox2d(obj.box2d),
-      };
-    })
-    .filter((c): c is ExtractedVocab => c !== null)
-    .slice(0, 4);
-
   return {
     userTranscript: stripByteFallback(String(parsed.userTranscript ?? fallbackQuestion)),
     replySegments,
     translationSummary: stripByteFallback(String(parsed.translationSummary ?? '')),
-    vocabCards,
+    vocabCards: parseVocabCardList(parsed.vocabCards),
+  };
+}
+
+export function parseVocabCardsOnly(rawText: string): {
+  translationSummary: string;
+  vocabCards: ExtractedVocab[];
+} {
+  const jsonText = extractJsonObjectText(rawText);
+  const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+  return {
+    translationSummary: stripByteFallback(String(parsed.translationSummary ?? '')),
+    vocabCards: parseVocabCardList(parsed.vocabCards),
+  };
+}
+
+export interface ParsedStreamReply {
+  userTranscript?: string;
+  segments: ReplySegment[];
+  plainText: string;
+}
+
+/**
+ * Incrementally parses Pass 1 streaming tutor text with optional leading `Q: ...` line
+ * and inline `<t>target phrase</t>` markers, safely stripping partial trailing tags.
+ */
+export function parseStreamingReply(raw: string): ParsedStreamReply {
+  const cleaned = raw.replace(/<0x[0-9A-Fa-f]{2}>/g, '');
+  let userTranscript: string | undefined;
+  let body = cleaned;
+
+  const trimmedLead = cleaned.trimStart();
+  if (/^Q:/i.test(trimmedLead)) {
+    const nl = trimmedLead.indexOf('\n');
+    if (nl === -1) {
+      return {
+        userTranscript: trimmedLead.replace(/^Q:\s*/i, '').trim(),
+        segments: [],
+        plainText: '',
+      };
+    }
+    userTranscript = trimmedLead.slice(0, nl).replace(/^Q:\s*/i, '').trim();
+    body = trimmedLead.slice(nl + 1).trimStart();
+  }
+
+  // Strip any incomplete trailing tag prefix like "<", "<t", "</", "</t"
+  body = body.replace(/<\/?t?$/i, '');
+
+  const segments: ReplySegment[] = [];
+  let cursor = 0;
+  let inTarget = false;
+
+  while (cursor < body.length) {
+    if (!inTarget) {
+      const openIdx = body.indexOf('<t>', cursor);
+      if (openIdx === -1) {
+        const tail = body.slice(cursor).replace(/<\/?t>/gi, '');
+        if (tail) segments.push({ text: tail, isTarget: false });
+        break;
+      }
+      if (openIdx > cursor) {
+        const before = body.slice(cursor, openIdx).replace(/<\/t>/gi, '');
+        if (before) segments.push({ text: before, isTarget: false });
+      }
+      cursor = openIdx + 3;
+      inTarget = true;
+    } else {
+      const closeIdx = body.indexOf('</t>', cursor);
+      if (closeIdx === -1) {
+        const tail = body.slice(cursor).replace(/<t>/gi, '');
+        if (tail) segments.push({ text: tail, isTarget: true });
+        break;
+      }
+      if (closeIdx > cursor) {
+        const inner = body.slice(cursor, closeIdx).replace(/<t>/gi, '');
+        if (inner) segments.push({ text: inner, isTarget: true });
+      }
+      cursor = closeIdx + 4;
+      inTarget = false;
+    }
+  }
+
+  return {
+    userTranscript,
+    segments,
+    plainText: segments.map((s) => s.text).join(''),
   };
 }

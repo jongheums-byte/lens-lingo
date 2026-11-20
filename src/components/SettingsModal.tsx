@@ -234,8 +234,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 onUpdateSettings({ ...settings, tutorModel: e.target.value as TutorModelId })
               }
             >
-              <option value="gemini-3.8-flash">Gemini 3.8 Flash (균형·고정확도 추천)</option>
-              <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite (초고속·절약형)</option>
+              <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite (실시간 초고속 추천)</option>
+              <option value="gemini-3.8-flash">Gemini 3.8 Flash (고정확 · Low Thinking)</option>
             </select>
           </label>
 

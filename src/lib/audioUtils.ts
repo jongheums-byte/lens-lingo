@@ -102,6 +102,75 @@ export async function blobTo16kWavBase64(
   };
 }
 
+/**
+ * Fast path for Gemini audio upload: sends webm/ogg/wav directly without AudioContext decoding,
+ * and falls back to 16kHz WAV conversion only for containers like mp4/m4a (e.g. iOS Safari).
+ */
+export async function prepareAudioForGemini(
+  blob: Blob,
+): Promise<{ base64: string; mimeType: string }> {
+  const mime = stripMimeCodecs(blob.type || 'audio/webm');
+  if (mime === 'audio/webm' || mime === 'audio/ogg' || mime === 'audio/wav') {
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    return {
+      base64: uint8ArrayToBase64(buf),
+      mimeType: mime,
+    };
+  }
+  return blobTo16kWavBase64(blob);
+}
+
+/**
+ * Wraps streamed 16-bit signed little-endian mono PCM chunks into a standard RIFF WAV Blob
+ * so completed Gemini streaming TTS audio can be cached for instant zero-API replay.
+ */
+export function wrapPcm16BytesToWavBlob(
+  pcmChunks: Uint8Array[],
+  sampleRate = 24000,
+): Blob {
+  const totalBytes = pcmChunks.reduce((acc, c) => acc + c.byteLength, 0);
+  const alignedBytes = totalBytes - (totalBytes % 2);
+  const header = new ArrayBuffer(44);
+  const view = new DataView(header);
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + alignedBytes, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, alignedBytes, true);
+
+  const combined = new Uint8Array(44 + alignedBytes);
+  combined.set(new Uint8Array(header), 0);
+  let offset = 44;
+  for (const chunk of pcmChunks) {
+    const remaining = 44 + alignedBytes - offset;
+    if (remaining <= 0) break;
+    if (chunk.byteLength <= remaining) {
+      combined.set(chunk, offset);
+      offset += chunk.byteLength;
+    } else {
+      combined.set(chunk.subarray(0, remaining), offset);
+      offset += remaining;
+    }
+  }
+
+  return new Blob([combined.buffer], { type: 'audio/wav' });
+}
+
 let sharedSfxCtx: AudioContext | null = null;
 
 function getSfxContext(): AudioContext | null {

@@ -368,3 +368,39 @@ button:disabled {
 .field-input:focus {
   border-color: var(--accent-sky);
 }
+
+@keyframes shimmerPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+.shimmer-card {
+  animation: shimmerPulse 1.15s ease-in-out infinite;
+}
+
+@keyframes cursorBlink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.15;
+  }
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 4px;
+  vertical-align: middle;
+  border-radius: 2px;
+  background: var(--accent-sky);
+  animation: cursorBlink 0.7s ease-in-out infinite;
+}
+

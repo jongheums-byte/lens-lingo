@@ -1,11 +1,12 @@
 import { TARGET_LANGUAGES } from '../config/languages';
+import { wrapPcm16BytesToWavBlob } from '../lib/audioUtils';
 import type {
   AppSettings,
   ReplySegment,
   TargetLanguageCode,
   TtsEngineKind,
 } from '../types/app';
-import { synthesizeGeminiTts } from './geminiService';
+import { streamGeminiTtsChunks } from './geminiService';
 
 export type TtsPlaybackState = 'idle' | 'loading' | 'playing';
 
@@ -16,9 +17,23 @@ export interface SpeakSegmentsCallbacks {
 
 class HybridTtsController {
   private audioEl: HTMLAudioElement | null = null;
+  private playbackCtx: AudioContext | null = null;
+  private activeSources: AudioBufferSourceNode[] = [];
   private audioCache = new Map<string, string>();
   private segmentTimerIds: number[] = [];
   private activeRunId = 0;
+
+  private ensureAudioContext(): AudioContext | null {
+    if (typeof window === 'undefined') return null;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return null;
+    if (!this.playbackCtx || this.playbackCtx.state === 'closed') {
+      this.playbackCtx = new AudioCtx();
+    }
+    return this.playbackCtx;
+  }
 
   /**
    * Call synchronously inside click/tap handlers so iOS Safari allows async audio playback afterwards.
@@ -29,11 +44,14 @@ class HybridTtsController {
       this.audioEl = new Audio();
       this.audioEl.preload = 'auto';
     }
-    // Silent tiny WAV data URI to prime HTMLAudioElement on user gesture
     if (this.audioEl.paused) {
       this.audioEl.src =
         'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
       this.audioEl.play().catch(() => undefined);
+    }
+    const ctx = this.ensureAudioContext();
+    if (ctx && ctx.state === 'suspended') {
+      ctx.resume().catch(() => undefined);
     }
   }
 
@@ -43,6 +61,16 @@ class HybridTtsController {
       window.clearTimeout(tid);
     }
     this.segmentTimerIds = [];
+
+    for (const src of this.activeSources) {
+      try {
+        src.onended = null;
+        src.stop();
+      } catch {
+        // ignore already stopped sources
+      }
+    }
+    this.activeSources = [];
 
     if (this.audioEl) {
       this.audioEl.pause();
@@ -93,28 +121,28 @@ class HybridTtsController {
         const expressive = settings.ttsPreference === 'gemini_expressive';
         const cacheKey = `${settings.persona}:${expressive ? 'exp' : 'lite'}:${fullText}`;
 
-        let blobUrl = this.audioCache.get(cacheKey);
-        if (!blobUrl) {
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            window.setTimeout(() => reject(new Error('Gemini TTS timeout')), 12000),
-          );
-          const blob = await Promise.race([
-            synthesizeGeminiTts({
-              apiKey: settings.apiKey,
-              text: fullText,
-              persona: settings.persona,
-              expressive,
-            }),
-            timeoutPromise,
-          ]);
-          blobUrl = URL.createObjectURL(blob);
-          this.cachePut(cacheKey, blobUrl);
+        const cachedBlobUrl = this.audioCache.get(cacheKey);
+        if (cachedBlobUrl) {
+          if (runId !== this.activeRunId) return;
+          await this.playAudioWithSegmentHighlights(cachedBlobUrl, validSegments, runId, callbacks);
+          return;
         }
 
-        if (runId !== this.activeRunId) return;
-
-        await this.playAudioWithSegmentHighlights(blobUrl, validSegments, runId, callbacks);
-        return;
+        const streamed = await this.playStreamingGeminiPcm(
+          {
+            apiKey: settings.apiKey,
+            text: fullText,
+            persona: settings.persona,
+            expressive,
+          },
+          validSegments,
+          cacheKey,
+          runId,
+          callbacks,
+        );
+        if (streamed || runId !== this.activeRunId) {
+          return;
+        }
       } catch {
         if (runId !== this.activeRunId) return;
         // Fall through seamlessly to browser speech synthesis
@@ -127,6 +155,139 @@ class HybridTtsController {
       runId,
       callbacks,
     );
+  }
+
+  private async playStreamingGeminiPcm(
+    ttsParams: {
+      apiKey: string;
+      text: string;
+      persona: AppSettings['persona'];
+      expressive: boolean;
+    },
+    segments: ReplySegment[],
+    cacheKey: string,
+    runId: number,
+    callbacks: SpeakSegmentsCallbacks,
+  ): Promise<boolean> {
+    const ctx = this.ensureAudioContext();
+    if (!ctx) return false;
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => undefined);
+    }
+
+    let gotFirstChunk = false;
+    let nextStartTime = 0;
+    let sampleRate = 24000;
+    let leftoverByte: number | null = null;
+    const rawChunksForCache: Uint8Array[] = [];
+    let lastScheduledSource: AudioBufferSourceNode | null = null;
+    let totalScheduledDurationSec = 0;
+
+    const scheduleEstimatedHighlights = () => {
+      const estTotalMs = Math.max(
+        1400,
+        segments.reduce((acc, s) => acc + s.text.length * (s.isTarget ? 88 : 74), 0),
+      );
+      const weights = segments.map((s) => Math.max(2, s.text.trim().length + (s.isTarget ? 3 : 0)));
+      const sumWeights = weights.reduce((a, b) => a + b, 0);
+      let elapsed = 0;
+      segments.forEach((_, idx) => {
+        const tid = window.setTimeout(() => {
+          if (runId === this.activeRunId) {
+            callbacks.onSegmentChange?.(idx);
+          }
+        }, elapsed);
+        this.segmentTimerIds.push(tid);
+        elapsed += (weights[idx] / sumWeights) * estTotalMs;
+      });
+    };
+
+    try {
+      for await (const chunk of streamGeminiTtsChunks(ttsParams)) {
+        if (runId !== this.activeRunId) return true;
+        sampleRate = chunk.sampleRate || 24000;
+        rawChunksForCache.push(chunk.pcmBytes);
+
+        // Merge odd trailing byte from previous chunk so Int16 LE pairs align cleanly
+        let bytes = chunk.pcmBytes;
+        if (leftoverByte !== null) {
+          const merged = new Uint8Array(bytes.byteLength + 1);
+          merged[0] = leftoverByte;
+          merged.set(bytes, 1);
+          bytes = merged;
+          leftoverByte = null;
+        }
+        if (bytes.byteLength % 2 === 1) {
+          leftoverByte = bytes[bytes.byteLength - 1];
+          bytes = bytes.subarray(0, bytes.byteLength - 1);
+        }
+        if (bytes.byteLength < 2) continue;
+
+        const sampleCount = bytes.byteLength >> 1;
+        const audioBuffer = ctx.createBuffer(1, sampleCount, sampleRate);
+        const channel = audioBuffer.getChannelData(0);
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        for (let i = 0; i < sampleCount; i++) {
+          channel[i] = view.getInt16(i * 2, true) / 32768;
+        }
+
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+
+        const startAt = Math.max(ctx.currentTime + 0.025, nextStartTime);
+        source.start(startAt);
+        nextStartTime = startAt + audioBuffer.duration;
+        totalScheduledDurationSec += audioBuffer.duration;
+        this.activeSources.push(source);
+        lastScheduledSource = source;
+
+        if (!gotFirstChunk) {
+          gotFirstChunk = true;
+          callbacks.onStateChange?.('playing', 'gemini');
+          callbacks.onSegmentChange?.(0);
+          scheduleEstimatedHighlights();
+        }
+      }
+    } catch (err) {
+      if (!gotFirstChunk) {
+        throw err;
+      }
+    }
+
+    if (!gotFirstChunk || !lastScheduledSource) {
+      return false;
+    }
+
+    // Cache full WAV in memory for instant zero-API replay
+    if (rawChunksForCache.length > 0) {
+      const wavBlob = wrapPcm16BytesToWavBlob(rawChunksForCache, sampleRate);
+      const wavUrl = URL.createObjectURL(wavBlob);
+      this.cachePut(cacheKey, wavUrl);
+    }
+
+    await new Promise<void>((resolve) => {
+      const safetyMs = Math.max(800, (totalScheduledDurationSec + 1.5) * 1000);
+      const safetyTid = window.setTimeout(() => {
+        if (runId === this.activeRunId) {
+          callbacks.onSegmentChange?.(-1);
+          callbacks.onStateChange?.('idle', 'gemini');
+        }
+        resolve();
+      }, safetyMs);
+      this.segmentTimerIds.push(safetyTid);
+
+      lastScheduledSource!.onended = () => {
+        window.clearTimeout(safetyTid);
+        if (runId === this.activeRunId) {
+          callbacks.onSegmentChange?.(-1);
+          callbacks.onStateChange?.('idle', 'gemini');
+        }
+        resolve();
+      };
+    });
+
+    return true;
   }
 
   private playAudioWithSegmentHighlights(
@@ -239,7 +400,7 @@ class HybridTtsController {
         utt.lang = langTag;
         const matched = findVoice(langTag);
         if (matched) utt.voice = matched;
-        utt.rate = seg.isTarget ? 0.92 : 1.03;
+        utt.rate = seg.isTarget ? 0.95 : 1.05;
 
         const safetyTimer = window.setTimeout(resolve, Math.max(2500, seg.text.length * 190));
         this.segmentTimerIds.push(safetyTimer);

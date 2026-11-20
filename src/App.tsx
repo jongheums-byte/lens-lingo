@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { CameraHudView } from './components/CameraHudView';
 import { HistorySideSheet } from './components/HistorySideSheet';
 import { OnboardingModal } from './components/OnboardingModal';
@@ -13,7 +13,7 @@ import {
   runDemoTutor,
   type DemoSceneId,
 } from './services/demoService';
-import { askTutor } from './services/geminiService';
+import { extractVocabCardsAsync, streamTutorReply } from './services/geminiService';
 import {
   deleteSession,
   deleteVocabCard,
@@ -78,10 +78,12 @@ export const App: React.FC = () => {
   );
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isExtractingCards, setIsExtractingCards] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [ttsState, setTtsState] = useState<TtsPlaybackState>('idle');
   const [ttsEngine, setTtsEngine] = useState<TtsEngineKind>('browser');
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(-1);
+  const turnSeqRef = useRef(0);
 
   const [editingCard, setEditingCard] = useState<SavedVocabCard | null>(null);
   const [showHistory, setShowHistory] = useState(false);
@@ -156,43 +158,226 @@ export const App: React.FC = () => {
     textQuestion?: string;
     demoSceneId?: DemoSceneId;
   }) => {
+    const turnSeq = ++turnSeqRef.current;
     setIsProcessing(true);
+    setIsExtractingCards(false);
     setErrorBanner(null);
     ttsController.stop();
 
+    const now = Date.now();
+    const userMsgId = `msg-u-${now}`;
+    const tutorMsgId = `msg-t-${now + 1}`;
+    const baseSession = activeSession;
+    const sessionId = baseSession.id;
+
+    const initialUserMsg: ChatMessage = {
+      id: userMsgId,
+      role: 'user',
+      timestamp: now,
+      text: params.textQuestion?.trim() || (params.audioBase64 ? '🎙️ 음성 질문 인식 중...' : '📸 장면 스캔'),
+      imageDataUrl: params.imageDataUrl,
+    };
+    const streamingTutorMsg: ChatMessage = {
+      id: tutorMsgId,
+      role: 'tutor',
+      timestamp: now + 1,
+      text: '',
+      segments: [],
+    };
+
+    const upsertTurnMessages = (
+      uMsg: ChatMessage,
+      tMsg: ChatMessage,
+      nextInteractionId?: string,
+    ) => {
+      setActiveSession((prev) => {
+        if (prev.id !== sessionId) return prev;
+        const others = prev.messages.filter((m) => m.id !== userMsgId && m.id !== tutorMsgId);
+        return {
+          ...prev,
+          language: settings.targetLanguage,
+          persona: settings.persona,
+          level: settings.level,
+          updatedAt: now,
+          previewImageDataUrl: prev.previewImageDataUrl || params.imageDataUrl,
+          previousInteractionId: nextInteractionId ?? prev.previousInteractionId,
+          messages: [...others, uMsg, tMsg],
+        };
+      });
+    };
+
+    upsertTurnMessages(initialUserMsg, streamingTutorMsg);
+
     try {
       const isDemo = settings.demoMode || !settings.apiKey.trim();
-      let payload;
-      let nextInteractionId = activeSession.previousInteractionId;
 
       if (isDemo) {
-        // Brief realistic delay in demo mode so scan animation is visible
-        await new Promise((r) => window.setTimeout(r, 450));
-        payload = runDemoTutor({
+        const startMs = performance.now();
+        const payload = runDemoTutor({
           sceneId: params.demoSceneId ?? 'cafe',
           language: settings.targetLanguage,
           persona: settings.persona,
           question: params.textQuestion,
         });
-      } else {
-        const imgParts = dataUrlToBase64Parts(params.imageDataUrl);
-        const result = await askTutor({
-          settings,
-          imageBase64: imgParts.base64,
-          imageMimeType: imgParts.mimeType,
-          audioBase64: params.audioBase64,
-          audioMimeType: params.audioMimeType,
-          textQuestion: params.textQuestion,
-          previousInteractionId: activeSession.previousInteractionId,
-        });
-        payload = result.payload;
-        nextInteractionId = result.interactionId || nextInteractionId;
+
+        const finalUserMsg: ChatMessage = {
+          ...initialUserMsg,
+          text: payload.userTranscript || initialUserMsg.text,
+        };
+
+        // Smooth fast simulated stream reveal in Demo Mode
+        for (let i = 1; i <= payload.replySegments.length; i++) {
+          await new Promise((r) => window.setTimeout(r, 38));
+          if (turnSeq !== turnSeqRef.current) return;
+          const partialSegs = payload.replySegments.slice(0, i);
+          upsertTurnMessages(finalUserMsg, {
+            ...streamingTutorMsg,
+            text: partialSegs.map((s) => s.text).join(''),
+            segments: partialSegs,
+          });
+        }
+
+        const latencyMs = Math.round(performance.now() - startMs);
+        const newCards: SavedVocabCard[] = await Promise.all(
+          payload.vocabCards.map(async (vc, idx) => {
+            const stickerDataUrl = await createStickerDataUrlFromImage(
+              params.imageDataUrl,
+              vc.box2d,
+              { shape: 'rounded', whiteBorder: true },
+            );
+            return {
+              id: `card-${now}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+              language: settings.targetLanguage,
+              word: vc.word,
+              reading: vc.reading,
+              koreanPronunciation: vc.koreanPronunciation,
+              meaning: vc.meaning,
+              partOfSpeech: vc.partOfSpeech,
+              exampleTarget: vc.exampleTarget,
+              exampleKorean: vc.exampleKorean,
+              stickerDataUrl,
+              sourceImageDataUrl: params.imageDataUrl,
+              box2d: vc.box2d,
+              stickerShape: 'rounded',
+              whiteBorder: true,
+              createdAt: now + idx,
+              reviewCount: 0,
+            };
+          }),
+        );
+
+        if (newCards.length > 0) {
+          await putVocabCards(newCards);
+          setSavedCards((prev) => [...newCards, ...prev]);
+          if (turnSeq === turnSeqRef.current) setRecentTrayCards(newCards);
+          playSfx('save');
+        }
+
+        const finalTutorMsg: ChatMessage = {
+          ...streamingTutorMsg,
+          text: payload.replySegments.map((s) => s.text).join(''),
+          segments: payload.replySegments,
+          translationSummary: payload.translationSummary,
+          vocabCardIds: newCards.map((c) => c.id),
+          extractedCards: payload.vocabCards,
+          latencyMs,
+        };
+
+        const completedSession: LearningSession = {
+          ...baseSession,
+          language: settings.targetLanguage,
+          persona: settings.persona,
+          level: settings.level,
+          updatedAt: now,
+          previewImageDataUrl: baseSession.previewImageDataUrl || params.imageDataUrl,
+          messages: [...baseSession.messages, finalUserMsg, finalTutorMsg],
+        };
+
+        if (turnSeq === turnSeqRef.current) {
+          upsertTurnMessages(finalUserMsg, finalTutorMsg);
+          setIsProcessing(false);
+        }
+        await putSession(completedSession);
+        setSessions((prev) => [completedSession, ...prev.filter((s) => s.id !== completedSession.id)]);
+
+        if (settings.autoPlayTts && turnSeq === turnSeqRef.current) {
+          playTutorSegments(finalTutorMsg, settings);
+        }
+        return;
       }
 
-      // Generate cropped die-cut photo stickers for each taught vocab card
-      const now = Date.now();
+      // Live Gemini 2-Pass Streaming Pipeline
+      const imgParts = dataUrlToBase64Parts(params.imageDataUrl);
+      const streamRes = await streamTutorReply({
+        settings,
+        imageBase64: imgParts.base64,
+        imageMimeType: imgParts.mimeType,
+        audioBase64: params.audioBase64,
+        audioMimeType: params.audioMimeType,
+        textQuestion: params.textQuestion,
+        previousInteractionId: baseSession.previousInteractionId,
+        onPartial: (partial) => {
+          if (turnSeq !== turnSeqRef.current) return;
+          upsertTurnMessages(
+            {
+              ...initialUserMsg,
+              text: partial.userTranscript || initialUserMsg.text,
+            },
+            {
+              ...streamingTutorMsg,
+              text: partial.plainText,
+              segments: partial.segments,
+            },
+          );
+        },
+      });
+
+      const finalUserMsg: ChatMessage = {
+        ...initialUserMsg,
+        text: streamRes.userTranscript,
+      };
+      const pass1TutorMsg: ChatMessage = {
+        ...streamingTutorMsg,
+        text: streamRes.plainText,
+        segments: streamRes.segments,
+        latencyMs: streamRes.totalMs,
+      };
+      const nextInteractionId = streamRes.interactionId || baseSession.previousInteractionId;
+
+      if (turnSeq === turnSeqRef.current) {
+        upsertTurnMessages(finalUserMsg, pass1TutorMsg, nextInteractionId);
+        setIsProcessing(false);
+        setIsExtractingCards(true);
+        setRecentTrayCards([]);
+        if (settings.autoPlayTts) {
+          // Kick off Streaming PCM TTS immediately in parallel with Pass 2!
+          playTutorSegments(pass1TutorMsg, settings);
+        }
+      }
+
+      const pass1Session: LearningSession = {
+        ...baseSession,
+        language: settings.targetLanguage,
+        persona: settings.persona,
+        level: settings.level,
+        updatedAt: now,
+        previewImageDataUrl: baseSession.previewImageDataUrl || params.imageDataUrl,
+        previousInteractionId: nextInteractionId,
+        messages: [...baseSession.messages, finalUserMsg, pass1TutorMsg],
+      };
+      await putSession(pass1Session);
+      setSessions((prev) => [pass1Session, ...prev.filter((s) => s.id !== pass1Session.id)]);
+
+      // Pass 2 (Background): Extract vocab cards + box2d and crop die-cut stickers
+      const pass2 = await extractVocabCardsAsync({
+        settings,
+        replyText: streamRes.plainText,
+        imageBase64: imgParts.base64,
+        imageMimeType: imgParts.mimeType,
+      });
+
       const newCards: SavedVocabCard[] = await Promise.all(
-        payload.vocabCards.map(async (vc, idx) => {
+        pass2.vocabCards.map(async (vc, idx) => {
           const stickerDataUrl = await createStickerDataUrlFromImage(
             params.imageDataUrl,
             vc.box2d,
@@ -222,56 +407,47 @@ export const App: React.FC = () => {
       if (newCards.length > 0) {
         await putVocabCards(newCards);
         setSavedCards((prev) => [...newCards, ...prev]);
-        setRecentTrayCards(newCards);
-        playSfx('save');
+        if (turnSeq === turnSeqRef.current) {
+          setRecentTrayCards(newCards);
+          playSfx('save');
+        }
       }
 
-      const userMsg: ChatMessage = {
-        id: `msg-u-${now}`,
-        role: 'user',
-        timestamp: now,
-        text: payload.userTranscript || params.textQuestion || '📸 장면 스캔',
-        imageDataUrl: params.imageDataUrl,
-      };
-
-      const tutorText = payload.replySegments.map((s) => s.text).join('');
-      const tutorMsg: ChatMessage = {
-        id: `msg-t-${now + 1}`,
-        role: 'tutor',
-        timestamp: now + 1,
-        text: tutorText,
-        segments: payload.replySegments,
-        translationSummary: payload.translationSummary,
+      const finalTutorMsg: ChatMessage = {
+        ...pass1TutorMsg,
+        translationSummary: pass2.translationSummary || pass1TutorMsg.translationSummary,
         vocabCardIds: newCards.map((c) => c.id),
-        extractedCards: payload.vocabCards,
+        extractedCards: pass2.vocabCards,
       };
-
-      const updatedSession: LearningSession = {
-        ...activeSession,
-        language: settings.targetLanguage,
-        persona: settings.persona,
-        level: settings.level,
-        updatedAt: now,
-        previewImageDataUrl: activeSession.previewImageDataUrl || params.imageDataUrl,
-        previousInteractionId: nextInteractionId,
-        messages: [...activeSession.messages, userMsg, tutorMsg],
+      const finalSession: LearningSession = {
+        ...pass1Session,
+        messages: [...baseSession.messages, finalUserMsg, finalTutorMsg],
       };
-
-      setActiveSession(updatedSession);
-      await putSession(updatedSession);
-      setSessions((prev) => {
-        const rest = prev.filter((s) => s.id !== updatedSession.id);
-        return [updatedSession, ...rest];
-      });
-
-      if (settings.autoPlayTts) {
-        playTutorSegments(tutorMsg, settings);
+      if (turnSeq === turnSeqRef.current) {
+        upsertTurnMessages(finalUserMsg, finalTutorMsg, nextInteractionId);
       }
+      await putSession(finalSession);
+      setSessions((prev) => [finalSession, ...prev.filter((s) => s.id !== finalSession.id)]);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setErrorBanner(`튜터 호출 오류: ${msg}`);
+      // Roll back empty placeholder if Pass 1 failed completely
+      setActiveSession((prev) => {
+        if (prev.id !== sessionId) return prev;
+        const target = prev.messages.find((m) => m.id === tutorMsgId);
+        if (target && !target.text) {
+          return {
+            ...prev,
+            messages: prev.messages.filter((m) => m.id !== userMsgId && m.id !== tutorMsgId),
+          };
+        }
+        return prev;
+      });
     } finally {
-      setIsProcessing(false);
+      if (turnSeq === turnSeqRef.current) {
+        setIsProcessing(false);
+        setIsExtractingCards(false);
+      }
     }
   };
 
@@ -345,6 +521,7 @@ export const App: React.FC = () => {
             ttsEngine={ttsEngine}
             activeSegmentIndex={activeSegmentIndex}
             isProcessing={isProcessing}
+            isExtractingCards={isExtractingCards}
             errorBanner={errorBanner}
             onClearError={() => setErrorBanner(null)}
             onUpdateSettings={handleUpdateSettings}

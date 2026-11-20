@@ -47,7 +47,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   persona: 'buddy',
   level: 'beginner',
   customPersonaPrompt: '',
-  tutorModel: 'gemini-3.8-flash',
+  tutorModel: 'gemini-3.5-flash-lite',
   ttsPreference: 'hybrid',
   autoPlayTts: true,
   vocabPopperBestScore: 0,
