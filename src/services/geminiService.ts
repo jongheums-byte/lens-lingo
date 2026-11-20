@@ -27,6 +27,50 @@ function createClient(apiKey: string): GoogleGenAI {
   });
 }
 
+function getErrorStatusCode(err: unknown): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const obj = err as Record<string, unknown>;
+  if (typeof obj.statusCode === 'number') return obj.statusCode;
+  if (typeof obj.status === 'number') return obj.status;
+  return undefined;
+}
+
+export function formatGeminiError(err: unknown): string {
+  console.error('[LensLingo Gemini Error]', err);
+  if (err && typeof err === 'object') {
+    const obj = err as Record<string, unknown>;
+    const status = getErrorStatusCode(err);
+    const prefix = status ? `[HTTP ${status}] ` : '';
+
+    if (typeof obj.body === 'string' && obj.body.trim()) {
+      try {
+        const parsed = JSON.parse(obj.body) as Record<string, unknown>;
+        const nestedErr = parsed.error as Record<string, unknown> | undefined;
+        const bodyMsg =
+          (typeof nestedErr?.message === 'string' && nestedErr.message) ||
+          (typeof parsed.message === 'string' && parsed.message);
+        if (bodyMsg) return `${prefix}${bodyMsg}`;
+      } catch {
+        return `${prefix}${obj.body.slice(0, 220)}`;
+      }
+    }
+
+    if (obj.error && typeof obj.error === 'object') {
+      const e1 = obj.error as Record<string, unknown>;
+      const e2 = e1.error && typeof e1.error === 'object' ? (e1.error as Record<string, unknown>) : undefined;
+      const errMsg =
+        (typeof e2?.message === 'string' && e2.message) ||
+        (typeof e1.message === 'string' && e1.message);
+      if (errMsg) return `${prefix}${errMsg}`;
+    }
+
+    if (typeof obj.message === 'string' && obj.message) {
+      return `${prefix}${obj.message}`;
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 function buildSystemInstruction(settings: AppSettings): string {
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
   const level = PROFICIENCY_LEVELS[settings.level];
@@ -95,20 +139,34 @@ export async function askTutor({
     });
   }
 
-  const interaction = await client.interactions.create({
-    model: settings.tutorModel,
-    system_instruction: buildSystemInstruction(settings),
-    previous_interaction_id: previousInteractionId || undefined,
-    input: inputBlocks,
-    response_format: {
-      type: 'text',
-      mime_type: 'application/json',
-      schema: TUTOR_RESPONSE_JSON_SCHEMA,
-    },
-    generation_config: {
-      temperature: 0.7,
-    },
-  });
+  const runCreate = (prevId?: string) =>
+    client.interactions.create({
+      model: settings.tutorModel,
+      system_instruction: buildSystemInstruction(settings),
+      ...(prevId ? { previous_interaction_id: prevId } : {}),
+      input: inputBlocks,
+      response_format: {
+        type: 'text',
+        mime_type: 'application/json',
+        schema: TUTOR_RESPONSE_JSON_SCHEMA,
+      },
+    });
+
+  let interaction;
+  try {
+    interaction = await runCreate(previousInteractionId?.trim() || undefined);
+  } catch (err) {
+    const status = getErrorStatusCode(err);
+    if (previousInteractionId?.trim() && (status === 400 || status === 404)) {
+      try {
+        interaction = await runCreate(undefined);
+      } catch (retryErr) {
+        throw new Error(formatGeminiError(retryErr));
+      }
+    } else {
+      throw new Error(formatGeminiError(err));
+    }
+  }
 
   const rawText = interaction.output_text ?? '';
   if (!rawText) {
@@ -191,7 +249,6 @@ export async function verifyGeminiApiKey(apiKey: string): Promise<{ ok: boolean;
     }
     return { ok: false, message: '응답을 받지 못했습니다.' };
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, message: `연결 실패: ${msg}` };
+    return { ok: false, message: `연결 실패: ${formatGeminiError(err)}` };
   }
 }
