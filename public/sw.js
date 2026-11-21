@@ -1,4 +1,4 @@
-const CACHE_NAME = 'lens-lingo-shell-v3';
+const CACHE_NAME = 'lens-lingo-shell-v4';
 const APP_SHELL_URLS = [
   './',
   './index.html',

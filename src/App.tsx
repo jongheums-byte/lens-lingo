@@ -78,6 +78,7 @@ export const App: React.FC = () => {
   );
 
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingStage, setProcessingStage] = useState<string>('👀 장면을 살펴보는 중...');
   const [isExtractingCards, setIsExtractingCards] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [ttsState, setTtsState] = useState<TtsPlaybackState>('idle');
@@ -188,6 +189,7 @@ export const App: React.FC = () => {
 
     const turnSeq = ++turnSeqRef.current;
     setIsProcessing(true);
+    setProcessingStage('📡 AI 서버에 장면 전송 중...');
     setIsExtractingCards(false);
     setErrorBanner(null);
     ttsController.stop();
@@ -335,6 +337,9 @@ export const App: React.FC = () => {
       }
 
       // Live Gemini 2-Pass Streaming Pipeline
+      // Only chain previousInteractionId for explicit follow-up questions (text/voice);
+      // fresh 1-tap scans start clean so old camera frames don't accumulate and slow down requests.
+      const isFollowUpQuestion = Boolean(params.textQuestion?.trim() || params.audioBase64);
       const imgParts = dataUrlToBase64Parts(params.imageDataUrl);
       const streamRes = await streamTutorReply({
         settings,
@@ -343,8 +348,11 @@ export const App: React.FC = () => {
         audioBase64: params.audioBase64,
         audioMimeType: params.audioMimeType,
         textQuestion: params.textQuestion,
-        previousInteractionId: baseSession.previousInteractionId,
+        previousInteractionId: isFollowUpQuestion ? baseSession.previousInteractionId : undefined,
         signal: turnAbortController.signal,
+        onStage: (stage) => {
+          if (turnSeq === turnSeqRef.current) setProcessingStage(stage);
+        },
         onPartial: (partial) => {
           if (turnSeq !== turnSeqRef.current) return;
           upsertTurnMessages(
@@ -554,6 +562,7 @@ export const App: React.FC = () => {
             ttsEngine={ttsEngine}
             activeSegmentIndex={activeSegmentIndex}
             isProcessing={isProcessing}
+            processingStage={processingStage}
             isExtractingCards={isExtractingCards}
             errorBanner={errorBanner}
             onClearError={() => setErrorBanner(null)}

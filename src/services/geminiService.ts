@@ -236,6 +236,7 @@ Fast Real-Time Tutoring Rules:
 export async function streamTutorReply(
   params: AskTutorParams & {
     onPartial: (partial: ParsedStreamReply) => void;
+    onStage?: (stage: string) => void;
   },
 ): Promise<StreamTutorResult> {
   const {
@@ -248,6 +249,7 @@ export async function streamTutorReply(
     previousInteractionId,
     signal,
     onPartial,
+    onStage,
   } = params;
 
   if (!settings.apiKey.trim()) {
@@ -305,8 +307,9 @@ export async function streamTutorReply(
     textQuestion?.trim() || (audioBase64 ? '🎙️ 음성 질문' : '📸 이거 뭐예요?');
 
   const runUnaryFallback = async (prevId?: string): Promise<StreamTutorResult> => {
+    onStage?.('⚡ 일반 모드로 재요청 중...');
     const data = await fetchInteractionJson(settings.apiKey, makePayload(prevId, false), {
-      timeoutMs: 12000,
+      timeoutMs: 22000,
       signal,
     });
     const rawText = extractTextFromInteractionObject(data);
@@ -330,11 +333,18 @@ export async function streamTutorReply(
   };
 
   const runSse = async (prevId?: string): Promise<StreamTutorResult> => {
-    // 10s hard deadline to receive first text token; reset/extended once tokens flow
-    let timed = createTimedController(10000, signal);
+    // 14s timeout waiting for HTTP response headers; once stream opens, extend to 25s and reset on any event
+    let timed = createTimedController(14000, signal);
+    let gotHeaders = false;
     let gotFirstToken = false;
 
+    const resetStreamTimer = (ms = 25000) => {
+      timed.clear();
+      timed = createTimedController(ms, signal);
+    };
+
     try {
+      onStage?.('📡 AI 서버에 장면 전송 중...');
       const res = await fetch(INTERACTIONS_ENDPOINT, {
         method: 'POST',
         headers: {
@@ -350,6 +360,10 @@ export async function streamTutorReply(
         const errText = await res.text().catch(() => '');
         throw new GeminiHttpError(res.status, extractApiErrorDetail(res.status, errText));
       }
+
+      gotHeaders = true;
+      resetStreamTimer(25000);
+      onStage?.('🧠 AI가 장면을 분석하는 중...');
 
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (!res.body || contentType.includes('application/json')) {
@@ -389,6 +403,9 @@ export async function streamTutorReply(
           return false;
         }
 
+        // Any valid SSE frame proves the server is alive — refresh idle timeout
+        resetStreamTimer(25000);
+
         if (ev.event_type === 'error') {
           const errObj = ev.error as Record<string, unknown> | undefined;
           throw new Error(
@@ -396,14 +413,20 @@ export async function streamTutorReply(
           );
         }
 
+        if (ev.event_type === 'step.start') {
+          const step = ev.step as Record<string, unknown> | undefined;
+          if (step?.type === 'thought') {
+            onStage?.('🧠 AI가 생각 정리 중...');
+          } else if (step?.type === 'model_output') {
+            onStage?.('💬 답변 생성 중...');
+          }
+        }
+
         const deltaText = extractEventTextDelta(ev);
         if (deltaText) {
           if (!gotFirstToken) {
             gotFirstToken = true;
             ttftMs = Math.round(performance.now() - startMs);
-            // Extend remaining stream timeout once first token arrives
-            timed.clear();
-            timed = createTimedController(15000, signal);
           }
           accumulated += deltaText;
           latestParsed = parseStreamingReply(accumulated);
@@ -473,13 +496,11 @@ export async function streamTutorReply(
         totalMs,
       };
     } catch (err) {
-      // If user explicitly cancelled, rethrow AbortError cleanly
       if (signal?.aborted) {
         throw err;
       }
-      // If SSE timed out before receiving a single token (e.g. mobile proxy buffering SSE),
-      // automatically fall back to a clean unary request once.
-      if (timed.didTimeout() && !gotFirstToken) {
+      // Only fall back to unary if SSE stalled before headers or before any text arrived
+      if (timed.didTimeout() && (!gotHeaders || !gotFirstToken)) {
         return runUnaryFallback(prevId);
       }
       throw err;

@@ -39,6 +39,7 @@ interface CameraHudViewProps {
   ttsEngine: TtsEngineKind;
   activeSegmentIndex: number;
   isProcessing: boolean;
+  processingStage: string;
   isExtractingCards: boolean;
   errorBanner: string | null;
   onClearError: () => void;
@@ -72,6 +73,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
   ttsEngine,
   activeSegmentIndex,
   isProcessing,
+  processingStage,
   isExtractingCards,
   errorBanner,
   onClearError,
@@ -200,7 +202,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
 
     if (cameraReady && videoRef.current && videoRef.current.videoWidth > 0) {
       const vid = videoRef.current;
-      const maxDim = 640;
+      const maxDim = 512;
       const ratio = Math.min(1, maxDim / Math.max(vid.videoWidth, vid.videoHeight));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(vid.videoWidth * ratio);
@@ -208,7 +210,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        return canvas.toDataURL('image/jpeg', 0.72);
+        return canvas.toDataURL('image/jpeg', 0.68);
       }
     }
 
@@ -814,7 +816,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
             <div style={{ fontSize: '14.5px', lineHeight: 1.58, fontWeight: 500 }}>
               {isProcessing && !latestTutorMsg.text ? (
                 <span style={{ color: '#BAE6FD' }}>
-                  👀 장면을 살펴보는 중... ({elapsedSec.toFixed(1)}초)
+                  {processingStage} ({elapsedSec.toFixed(1)}초)
                 </span>
               ) : (
                 <>

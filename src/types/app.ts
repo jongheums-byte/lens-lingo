@@ -93,6 +93,7 @@ export interface AppSettings {
   ttsPreference: TtsPreference;
   autoPlayTts: boolean;
   vocabPopperBestScore: number;
+  settingsVersion?: number;
 }
 
 export type ActiveView = 'hud' | 'vocab' | 'popper';

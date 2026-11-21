@@ -51,6 +51,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   ttsPreference: 'hybrid',
   autoPlayTts: true,
   vocabPopperBestScore: 0,
+  settingsVersion: 2,
 };
 
 export function loadSettings(): AppSettings {
@@ -58,10 +59,17 @@ export function loadSettings(): AppSettings {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return { ...DEFAULT_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<AppSettings>;
-    return {
+    const merged: AppSettings = {
       ...DEFAULT_SETTINGS,
       ...parsed,
     };
+    // One-time migration for v1 users whose localStorage defaulted to slower gemini-3.8-flash
+    if ((parsed.settingsVersion ?? 1) < 2) {
+      merged.tutorModel = 'gemini-3.5-flash-lite';
+      merged.settingsVersion = 2;
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
+    }
+    return merged;
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
