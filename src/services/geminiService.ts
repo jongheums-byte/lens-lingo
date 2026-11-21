@@ -1,6 +1,11 @@
 import { PROFICIENCY_LEVELS, TARGET_LANGUAGES } from '../config/languages';
 import { PERSONAS } from '../config/personas';
+import { CONVERSATION_SCENARIOS } from '../config/scenarios';
 import { base64ToUint8Array } from '../lib/audioUtils';
+import {
+  parseConversationStream,
+  type ParsedConversationReply,
+} from '../lib/conversationParser';
 import {
   extractAudioFromInteractionObject,
   extractCompletedFallbackText,
@@ -19,9 +24,13 @@ import {
 } from '../lib/tutorParser';
 import type {
   AppSettings,
+  ChatMessage,
+  CoachingTip,
+  ConversationScenarioId,
   ExtractedVocab,
   PersonaId,
   ReplySegment,
+  SuggestedReply,
   TutorModelId,
   TutorResponsePayload,
 } from '../types/app';
@@ -604,6 +613,453 @@ export async function streamTutorReply(
     });
 
     return result;
+  } catch (err) {
+    if (signal?.aborted) {
+      throw err;
+    }
+    throw new Error(formatGeminiError(err));
+  } finally {
+    settled = true;
+    primaryCtrl.abort();
+    hedgeCtrl.abort();
+    signal?.removeEventListener('abort', linkExternal);
+  }
+}
+
+export interface StreamConversationParams {
+  settings: AppSettings;
+  scenarioId: ConversationScenarioId;
+  customTopic?: string;
+  history: ChatMessage[];
+  userText?: string;
+  audioBase64?: string;
+  audioMimeType?: string;
+  isOpening?: boolean;
+  signal?: AbortSignal;
+  onPartial: (partial: ParsedConversationReply) => void;
+  onReplyReady?: (partial: ParsedConversationReply) => void;
+  onStage?: (stage: string) => void;
+}
+
+export interface StreamConversationResult {
+  userTranscript?: string;
+  replyText: string;
+  koreanTranslation?: string;
+  coachingTip?: CoachingTip;
+  suggestedReplies: SuggestedReply[];
+  vocabCards: ExtractedVocab[];
+  ttftMs: number;
+  totalMs: number;
+}
+
+function buildConversationInstruction(
+  settings: AppSettings,
+  scenarioId: ConversationScenarioId,
+  customTopic: string | undefined,
+  hasAudio: boolean,
+  isOpening: boolean,
+): string {
+  const lang = TARGET_LANGUAGES[settings.targetLanguage];
+  const persona = PERSONAS[settings.persona];
+  const scenario = CONVERSATION_SCENARIOS[scenarioId];
+
+  const levelGuide =
+    settings.level === 'beginner'
+      ? `Level: BEGINNER. Use very easy vocabulary and 1-2 short clear sentences in ${lang.englishName} (max ~18 words). Keep follow-up questions simple.`
+      : settings.level === 'intermediate'
+        ? `Level: INTERMEDIATE. Use natural everyday conversational ${lang.englishName} in 2 concise sentences with practical collocations and a friendly follow-up question.`
+        : `Level: ADVANCED. Speak like an authentic native ${lang.englishName} speaker using natural idioms, nuance, and register in 2-3 crisp sentences with an engaging follow-up question.`;
+
+  const custom = settings.customPersonaPrompt.trim();
+  const personaLine = custom
+    ? custom.replaceAll('{MAIN_LANGUAGE}', 'Korean').replaceAll('{LEARN_LANGUAGE}', lang.englishName)
+    : `You are ${persona.name} (${persona.koreanTitle}), acting as ${scenario.aiRolePrompt}.`;
+
+  const topicLine =
+    scenarioId === 'custom' && customTopic?.trim()
+      ? `Custom scenario topic: "${customTopic.trim()}".`
+      : `Scenario: ${scenario.title} (${scenario.subtitle}).`;
+
+  const qRule = hasAudio ? `Line 1: "Q: <exact transcript of what the user said>"\n` : '';
+  const tipRule = isOpening
+    ? ''
+    : `TIP: <more natural ${lang.englishName} way to say what the user just tried to express> | <1 short Korean coaching tip> (ONLY include TIP: if the user made a mistake, sounded unnatural, or spoke in Korean; omit TIP: completely if already natural)\n`;
+
+  return `${personaLine}
+${topicLine}
+${levelGuide}
+Reply ONLY in ${lang.englishName} for the main dialogue lines (NO Korean in the main reply).
+Output strictly in this fast plain-text format (NO markdown, NO JSON):
+${qRule}<Your spoken reply in ${lang.englishName}>
+TR: <Natural Korean translation of your reply>
+${tipRule}H: <short suggested next reply 1 in ${lang.englishName} matching the learner's level> | <Korean meaning>
+H: <short suggested next reply 2 in ${lang.englishName} matching the learner's level> | <Korean meaning>
+W: <1 useful ${lang.englishName} word/phrase from this turn> | <한글 발음/읽기> | <한국어 뜻> | <short ${lang.englishName} example> | <한국어 예문뜻>`;
+}
+
+/**
+ * Ultra-fast level-matched Conversation Partner stream (no camera image payload, typically 1.5-4s).
+ * Includes 4.5s Hedged Backup + early `onReplyReady` TTS trigger as soon as `TR:` starts.
+ */
+export async function streamConversationReply(
+  params: StreamConversationParams,
+): Promise<StreamConversationResult> {
+  const {
+    settings,
+    scenarioId,
+    customTopic,
+    history,
+    userText,
+    audioBase64,
+    audioMimeType = 'audio/wav',
+    isOpening = false,
+    signal,
+    onPartial,
+    onReplyReady,
+    onStage,
+  } = params;
+
+  if (!settings.apiKey.trim()) {
+    throw new Error('Gemini API 키가 설정되지 않았습니다.');
+  }
+
+  const scenario = CONVERSATION_SCENARIOS[scenarioId];
+  const startMs = performance.now();
+
+  const recentTurns = history
+    .filter((m) => m.text.trim().length > 0)
+    .slice(-6)
+    .map((m) => `${m.role === 'user' ? 'Learner' : 'Partner'}: ${m.text.trim().slice(0, 180)}`)
+    .join('\n');
+
+  let promptText: string;
+  if (isOpening) {
+    promptText =
+      scenarioId === 'custom' && customTopic?.trim()
+        ? `Start a natural roleplay conversation about "${customTopic.trim()}". ${scenario.openingGoalPrompt}`
+        : scenario.openingGoalPrompt;
+  } else if (audioBase64) {
+    promptText = recentTurns
+      ? `Conversation so far:\n${recentTurns}\n\nRespond naturally to the learner's spoken audio turn.`
+      : `Respond naturally to the learner's spoken audio turn.`;
+  } else {
+    const cleanUser = (userText ?? '').trim();
+    promptText = recentTurns
+      ? `Conversation so far:\n${recentTurns}\n\nLearner: ${cleanUser}\nRespond naturally to continue the conversation.`
+      : `Learner: ${cleanUser}\nRespond naturally to continue the conversation.`;
+  }
+
+  type InputBlock =
+    | { type: 'text'; text: string }
+    | { type: 'audio'; data: string; mime_type: string };
+
+  const inputBlocks: InputBlock[] = [{ type: 'text', text: promptText }];
+  if (audioBase64) {
+    inputBlocks.push({
+      type: 'audio',
+      data: audioBase64,
+      mime_type: audioMimeType,
+    });
+  }
+
+  const systemInstruction = buildConversationInstruction(
+    settings,
+    scenarioId,
+    customTopic,
+    Boolean(audioBase64),
+    isOpening,
+  );
+
+  const makePayload = (model: TutorModelId, stream: boolean): Record<string, unknown> => ({
+    model,
+    system_instruction: systemInstruction,
+    input: inputBlocks,
+    store: false,
+    generation_config: {
+      thinking_level: getFastThinkingLevel(model),
+      max_output_tokens: 320,
+    },
+    stream,
+  });
+
+  const primaryCtrl = new AbortController();
+  const hedgeCtrl = new AbortController();
+  let settled = false;
+  let gotFirstToken = false;
+  let firedReplyReady = false;
+
+  const linkExternal = () => {
+    primaryCtrl.abort();
+    hedgeCtrl.abort();
+  };
+  if (signal) {
+    if (signal.aborted) {
+      linkExternal();
+    } else {
+      signal.addEventListener('abort', linkExternal, { once: true });
+    }
+  }
+
+  const runPrimarySse = async (): Promise<StreamConversationResult> => {
+    let timed = createTimedController(10500, primaryCtrl.signal);
+
+    try {
+      onStage?.(isOpening ? '💬 첫 인사말 준비 중...' : '💬 답변 생각하는 중...');
+      const res = await fetch(INTERACTIONS_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+          'x-goog-api-key': settings.apiKey.trim(),
+        },
+        body: JSON.stringify(makePayload(settings.tutorModel, true)),
+        signal: timed.controller.signal,
+      });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new GeminiHttpError(res.status, extractApiErrorDetail(res.status, errText));
+      }
+
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+      if (!res.body || contentType.includes('application/json')) {
+        const jsonText = await res.text();
+        const data = JSON.parse(jsonText) as Record<string, unknown>;
+        const rawText = extractTextFromInteractionObject(data);
+        const parsed = parseConversationStream(rawText);
+        if (!settled) {
+          onPartial(parsed);
+          if (!firedReplyReady && parsed.replyText.trim()) {
+            firedReplyReady = true;
+            onReplyReady?.(parsed);
+          }
+        }
+        const totalMs = Math.round(performance.now() - startMs);
+        return {
+          userTranscript: parsed.userTranscript,
+          replyText: parsed.replyText || rawText,
+          koreanTranslation: parsed.koreanTranslation,
+          coachingTip: parsed.coachingTip,
+          suggestedReplies: parsed.suggestedReplies,
+          vocabCards: parsed.vocabCards,
+          ttftMs: totalMs,
+          totalMs,
+        };
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let sseBuffer = '';
+      let accumulated = '';
+      let ttftMs = 0;
+      let latestParsed: ParsedConversationReply = {
+        replyText: '',
+        replyReady: false,
+        suggestedReplies: [],
+        vocabCards: [],
+      };
+
+      const processFrameData = (rawData: string): boolean => {
+        if (rawData === '[DONE]') return true;
+        let ev: Record<string, unknown>;
+        try {
+          ev = JSON.parse(rawData) as Record<string, unknown>;
+        } catch {
+          return false;
+        }
+
+        if (ev.event_type === 'error') {
+          const errObj = ev.error as Record<string, unknown> | undefined;
+          throw new Error(
+            (typeof errObj?.message === 'string' && errObj.message) || 'Gemini 스트리밍 오류',
+          );
+        }
+
+        const deltaText = extractEventTextDelta(ev);
+        if (deltaText && !settled) {
+          if (!gotFirstToken) {
+            gotFirstToken = true;
+            ttftMs = Math.round(performance.now() - startMs);
+            hedgeCtrl.abort();
+            timed.clear();
+            timed = createTimedController(10000, primaryCtrl.signal);
+          }
+          accumulated += deltaText;
+          latestParsed = parseConversationStream(accumulated);
+          onPartial(latestParsed);
+          if (latestParsed.replyReady && !firedReplyReady && latestParsed.replyText.trim()) {
+            firedReplyReady = true;
+            onReplyReady?.(latestParsed);
+          }
+        }
+
+        if (ev.event_type === 'interaction.completed' && !accumulated.trim() && !settled) {
+          const fallbackText = extractCompletedFallbackText(ev);
+          if (fallbackText) {
+            gotFirstToken = true;
+            hedgeCtrl.abort();
+            accumulated = fallbackText;
+            latestParsed = parseConversationStream(accumulated);
+            onPartial(latestParsed);
+          }
+        }
+        return false;
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          const finalText = decoder.decode();
+          if (finalText) sseBuffer += finalText;
+          if (sseBuffer.trim()) {
+            const { events } = parseSseBuffer(sseBuffer + '\n\n');
+            for (const e of events) processFrameData(e.data);
+          }
+          break;
+        }
+
+        sseBuffer += decoder.decode(value, { stream: true });
+        const { events, remainder } = parseSseBuffer(sseBuffer);
+        sseBuffer = remainder;
+
+        let sawDone = false;
+        for (const e of events) {
+          if (processFrameData(e.data)) {
+            sawDone = true;
+            break;
+          }
+        }
+        if (sawDone) {
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
+      }
+
+      const totalMs = Math.round(performance.now() - startMs);
+      if (!latestParsed.replyText.trim()) {
+        throw new Error('회화 파트너 응답이 비어 있습니다.');
+      }
+
+      return {
+        userTranscript: latestParsed.userTranscript,
+        replyText: latestParsed.replyText,
+        koreanTranslation: latestParsed.koreanTranslation,
+        coachingTip: latestParsed.coachingTip,
+        suggestedReplies: latestParsed.suggestedReplies,
+        vocabCards: latestParsed.vocabCards,
+        ttftMs: ttftMs || totalMs,
+        totalMs,
+      };
+    } catch (err) {
+      if (timed.didTimeout() && !signal?.aborted) {
+        throw new Error('응답 시간 초과 (10초) — 다시 말씀해 주세요.');
+      }
+      throw err;
+    } finally {
+      timed.clear();
+    }
+  };
+
+  const runHedgedBackup = async (): Promise<StreamConversationResult> => {
+    await new Promise<void>((resolve, reject) => {
+      const tid = window.setTimeout(resolve, 4500);
+      const onAbort = () => {
+        window.clearTimeout(tid);
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      if (hedgeCtrl.signal.aborted) {
+        onAbort();
+      } else {
+        hedgeCtrl.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+
+    if (gotFirstToken || settled || hedgeCtrl.signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    onStage?.('⚡ 초고속 예비 경로 가동 중...');
+    const data = await fetchInteractionJson(
+      settings.apiKey,
+      makePayload('gemini-3.1-flash-lite', false),
+      { timeoutMs: 6500, signal: hedgeCtrl.signal },
+    );
+
+    if (gotFirstToken || settled) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    const rawText = extractTextFromInteractionObject(data);
+    if (!rawText.trim()) {
+      throw new Error('회화 파트너 응답이 비어 있습니다.');
+    }
+    const parsed = parseConversationStream(rawText);
+    const totalMs = Math.round(performance.now() - startMs);
+    onPartial(parsed);
+    return {
+      userTranscript: parsed.userTranscript,
+      replyText: parsed.replyText || rawText,
+      koreanTranslation: parsed.koreanTranslation,
+      coachingTip: parsed.coachingTip,
+      suggestedReplies: parsed.suggestedReplies,
+      vocabCards: parsed.vocabCards,
+      ttftMs: totalMs,
+      totalMs,
+    };
+  };
+
+  try {
+    const primaryPromise = runPrimarySse();
+    const hedgePromise = runHedgedBackup();
+
+    return await new Promise<StreamConversationResult>((resolve, reject) => {
+      let primaryErr: unknown = null;
+      let hedgeErr: unknown = null;
+      let primaryDone = false;
+      let hedgeDone = false;
+
+      const finishWin = (res: StreamConversationResult, winner: 'primary' | 'hedge') => {
+        if (settled) return;
+        settled = true;
+        if (winner === 'primary') hedgeCtrl.abort();
+        else primaryCtrl.abort();
+        resolve(res);
+      };
+
+      const checkBothFailed = () => {
+        if (!settled && primaryDone && hedgeDone) {
+          settled = true;
+          reject(primaryErr || hedgeErr || new Error('응답을 받지 못했습니다.'));
+        }
+      };
+
+      primaryPromise.then(
+        (res) => finishWin(res, 'primary'),
+        (err) => {
+          primaryDone = true;
+          primaryErr = err;
+          if (
+            err instanceof GeminiHttpError &&
+            (err.status === 400 || err.status === 401 || err.status === 403 || err.status === 429)
+          ) {
+            hedgeCtrl.abort();
+            settled = true;
+            reject(err);
+            return;
+          }
+          checkBothFailed();
+        },
+      );
+
+      hedgePromise.then(
+        (res) => finishWin(res, 'hedge'),
+        (err) => {
+          hedgeDone = true;
+          hedgeErr = err;
+          checkBothFailed();
+        },
+      );
+    });
   } catch (err) {
     if (signal?.aborted) {
       throw err;

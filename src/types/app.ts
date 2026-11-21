@@ -56,6 +56,26 @@ export interface SavedVocabCard {
   lastReviewedAt?: number;
 }
 
+export type SessionMode = 'scan' | 'chat';
+
+export type ConversationScenarioId =
+  | 'free_talk'
+  | 'cafe'
+  | 'travel'
+  | 'restaurant'
+  | 'business'
+  | 'custom';
+
+export interface CoachingTip {
+  betterPhrase: string;
+  koreanNote: string;
+}
+
+export interface SuggestedReply {
+  text: string;
+  korean: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'tutor';
@@ -64,6 +84,9 @@ export interface ChatMessage {
   imageDataUrl?: string;
   segments?: ReplySegment[];
   translationSummary?: string;
+  koreanTranslation?: string;
+  coachingTip?: CoachingTip;
+  suggestedReplies?: SuggestedReply[];
   vocabCardIds?: string[];
   extractedCards?: ExtractedVocab[];
   latencyMs?: number;
@@ -71,6 +94,10 @@ export interface ChatMessage {
 
 export interface LearningSession {
   id: string;
+  mode?: SessionMode;
+  scenarioId?: ConversationScenarioId;
+  scenarioTitle?: string;
+  customTopic?: string;
   language: TargetLanguageCode;
   persona: PersonaId;
   level: ProficiencyLevel;
@@ -96,6 +123,6 @@ export interface AppSettings {
   settingsVersion?: number;
 }
 
-export type ActiveView = 'hud' | 'vocab' | 'popper';
+export type ActiveView = 'hud' | 'chat' | 'vocab' | 'popper';
 
 export type TtsEngineKind = 'gemini' | 'browser';

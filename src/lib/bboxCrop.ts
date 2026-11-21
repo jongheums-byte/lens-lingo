@@ -212,3 +212,97 @@ export async function createStickerDataUrlFromImage(
   const webp = canvas.toDataURL('image/webp', 0.88);
   return webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/png');
 }
+
+/**
+ * Generates a die-cut typographic badge sticker for vocabulary saved from text/voice Conversation Mode.
+ */
+export function createTextStickerDataUrl(
+  word: string,
+  emoji = '💬',
+  accentColor = '#38BDF8',
+): string {
+  if (typeof document === 'undefined') return '';
+  const size = 320;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return '';
+
+  const pad = 20;
+  const border = 12;
+
+  // White die-cut outer card with soft shadow
+  ctx.save();
+  ctx.shadowColor = 'rgba(2, 6, 23, 0.45)';
+  ctx.shadowBlur = 16;
+  ctx.shadowOffsetY = 8;
+  ctx.fillStyle = '#FFFFFF';
+  traceShapePath(ctx, pad, pad, size - pad * 2, size - pad * 2, 'rounded');
+  ctx.fill();
+  ctx.restore();
+
+  // Inner dark gradient fill
+  const ix = pad + border;
+  const iy = pad + border;
+  const iw = size - (pad + border) * 2;
+  const ih = iw;
+
+  ctx.save();
+  traceShapePath(ctx, ix, iy, iw, ih, 'rounded');
+  ctx.clip();
+
+  const grad = ctx.createLinearGradient(ix, iy, ix + iw, iy + ih);
+  grad.addColorStop(0, '#0f172a');
+  grad.addColorStop(0.55, '#1e293b');
+  grad.addColorStop(1, accentColor);
+  ctx.fillStyle = grad;
+  ctx.fillRect(ix, iy, iw, ih);
+
+  // Subtle decorative glow orb
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
+  ctx.beginPath();
+  ctx.arc(ix + iw * 0.82, iy + ih * 0.22, 64, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Emoji badge
+  ctx.font = '68px "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(emoji, size / 2, size * 0.36);
+
+  // Word label (wrapped up to 2 lines cleanly)
+  const cleanWord = word.trim();
+  const fontSize = cleanWord.length > 16 ? 24 : cleanWord.length > 10 ? 28 : 34;
+  ctx.fillStyle = '#F8FAFC';
+  ctx.font = `800 ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+
+  const words = cleanWord.split(/\s+/);
+  const lines: string[] = [];
+  let current = '';
+  for (const w of words) {
+    const candidate = current ? `${current} ${w}` : w;
+    if (ctx.measureText(candidate).width <= iw - 34) {
+      current = candidate;
+    } else {
+      if (current) lines.push(current);
+      current = w;
+    }
+  }
+  if (current) lines.push(current);
+
+  const displayLines = lines.slice(0, 2);
+  if (lines.length > 2) {
+    displayLines[1] = `${displayLines[1].slice(0, Math.max(1, displayLines[1].length - 1))}…`;
+  }
+
+  const baseY = displayLines.length === 1 ? size * 0.68 : size * 0.63;
+  displayLines.forEach((line, idx) => {
+    ctx.fillText(line, size / 2, baseY + idx * (fontSize + 8), iw - 28);
+  });
+
+  ctx.restore();
+
+  const webp = canvas.toDataURL('image/webp', 0.88);
+  return webp.startsWith('data:image/webp') ? webp : canvas.toDataURL('image/png');
+}

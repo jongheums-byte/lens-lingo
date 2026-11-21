@@ -1,7 +1,8 @@
 import React from 'react';
 import { Clock, MessageSquare, Plus, Trash2, X } from 'lucide-react';
-import { TARGET_LANGUAGES } from '../config/languages';
+import { PROFICIENCY_LEVELS, TARGET_LANGUAGES } from '../config/languages';
 import { PERSONAS } from '../config/personas';
+import { CONVERSATION_SCENARIOS } from '../config/scenarios';
 import type { LearningSession } from '../types/app';
 
 interface HistorySideSheetProps {
@@ -9,6 +10,7 @@ interface HistorySideSheetProps {
   activeSessionId: string;
   onSelectSession: (session: LearningSession) => void;
   onNewSession: () => void;
+  onNewChatSession: () => void;
   onDeleteSession: (id: string) => void;
   onClose: () => void;
 }
@@ -28,6 +30,7 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
   activeSessionId,
   onSelectSession,
   onNewSession,
+  onNewChatSession,
   onDeleteSession,
   onClose,
 }) => {
@@ -68,17 +71,35 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
           </button>
         </div>
 
-        <button
-          type="button"
-          className="btn-primary"
-          onClick={() => {
-            onNewSession();
-            onClose();
-          }}
-          style={{ width: '100%' }}
-        >
-          <Plus size={16} /> 새 장면 대화 시작하기
-        </button>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => {
+              onNewChatSession();
+              onClose();
+            }}
+            style={{ width: '100%', fontSize: '12.5px', padding: '10px 8px' }}
+          >
+            <Plus size={15} /> 새 회화 시작
+          </button>
+          <button
+            type="button"
+            className="glass-pill"
+            onClick={() => {
+              onNewSession();
+              onClose();
+            }}
+            style={{
+              width: '100%',
+              justifyContent: 'center',
+              fontSize: '12.5px',
+              padding: '10px 8px',
+            }}
+          >
+            <Plus size={15} /> 새 장면 스캔
+          </button>
+        </div>
 
         <div
           className="no-scrollbar"
@@ -108,6 +129,9 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
             sessions.map((sess) => {
               const lang = TARGET_LANGUAGES[sess.language];
               const persona = PERSONAS[sess.persona];
+              const levelCfg = PROFICIENCY_LEVELS[sess.level];
+              const isChat = sess.mode === 'chat';
+              const scenario = CONVERSATION_SCENARIOS[sess.scenarioId ?? 'free_talk'];
               const isCurrent = sess.id === activeSessionId;
               const lastMsg = sess.messages[sess.messages.length - 1];
 
@@ -133,7 +157,7 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
                     alignItems: 'center',
                   }}
                 >
-                  {sess.previewImageDataUrl ? (
+                  {sess.previewImageDataUrl && !isChat ? (
                     <img
                       src={sess.previewImageDataUrl}
                       alt="장면 썸네일"
@@ -151,14 +175,18 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
                         width: '54px',
                         height: '54px',
                         borderRadius: '12px',
-                        background: 'rgba(255,255,255,0.08)',
+                        background: isChat
+                          ? `${scenario.accentColor}26`
+                          : 'rgba(255,255,255,0.08)',
+                        border: isChat ? `1px solid ${scenario.accentColor}55` : undefined,
                         display: 'flex',
                         alignItems: 'center',
                         justifyContent: 'center',
                         flexShrink: 0,
+                        fontSize: isChat ? '24px' : undefined,
                       }}
                     >
-                      <MessageSquare size={20} color="#94A3B8" />
+                      {isChat ? scenario.emoji : <MessageSquare size={20} color="#94A3B8" />}
                     </div>
                   )}
 
@@ -166,7 +194,9 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '3px' }}>
                       <span style={{ fontSize: '13px' }}>{lang.flag}</span>
                       <span style={{ fontSize: '12px', fontWeight: 700, color: '#BAE6FD' }}>
-                        {persona.emoji} {persona.name}
+                        {isChat
+                          ? `💬 ${sess.scenarioTitle || sess.customTopic || scenario.title}`
+                          : `${persona.emoji} ${persona.name}`}
                       </span>
                       <span style={{ fontSize: '11px', color: 'var(--text-muted)', marginLeft: 'auto' }}>
                         {formatRelativeTime(sess.updatedAt)}
@@ -185,7 +215,7 @@ export const HistorySideSheet: React.FC<HistorySideSheetProps> = ({
                       {lastMsg?.text || '대화 시작됨'}
                     </div>
                     <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: '2px' }}>
-                      메시지 {sess.messages.length}개
+                      {levelCfg.koreanLabel} · 메시지 {sess.messages.length}개
                     </div>
                   </div>
 

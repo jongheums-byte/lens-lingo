@@ -2,8 +2,13 @@ import { PERSONAS } from '../config/personas';
 import { createStickerDataUrlFromImage } from '../lib/bboxCrop';
 import type {
   Box2D,
+  CoachingTip,
+  ConversationScenarioId,
+  ExtractedVocab,
   PersonaId,
+  ProficiencyLevel,
   SavedVocabCard,
+  SuggestedReply,
   TargetLanguageCode,
   TutorResponsePayload,
 } from '../types/app';
@@ -973,4 +978,473 @@ export async function generateStarterVocabCards(
   }
 
   return cards;
+}
+
+export interface DemoConversationReply {
+  userTranscript?: string;
+  replyText: string;
+  koreanTranslation: string;
+  coachingTip?: CoachingTip;
+  suggestedReplies: SuggestedReply[];
+  vocabCards: ExtractedVocab[];
+}
+
+interface DemoDialogPreset {
+  opening: Record<ProficiencyLevel, { reply: string; tr: string; hints: SuggestedReply[] }>;
+  followUps: Array<{
+    reply: string;
+    tr: string;
+    tip: CoachingTip;
+    hints: SuggestedReply[];
+    vocab: ExtractedVocab;
+  }>;
+}
+
+const DEMO_CHAT_EN: Record<ConversationScenarioId, DemoDialogPreset> = {
+  free_talk: {
+    opening: {
+      beginner: {
+        reply: 'Hey! How is your day going today?',
+        tr: '안녕! 오늘 하루 어떻게 보내고 있어?',
+        hints: [
+          { text: "It's going pretty well!", korean: '꽤 잘 보내고 있어요!' },
+          { text: "I'm a bit tired today.", korean: '오늘은 조금 피곤해요.' },
+        ],
+      },
+      intermediate: {
+        reply: "Hey there! How's your week been treating you so far? Anything fun planned?",
+        tr: '안녕! 이번 주는 지금까지 어땠어? 재미있는 계획 있어?',
+        hints: [
+          { text: 'Pretty busy, so I want to relax this weekend.', korean: '꽤 바빠서 이번 주말엔 쉬고 싶어요.' },
+          { text: "I'm planning to check out a new cafe.", korean: '새 카페에 가볼 계획이에요.' },
+        ],
+      },
+      advanced: {
+        reply: "Hey! Long time no see—how have you been holding up lately? Anything exciting on your radar?",
+        tr: '안녕! 오랜만이야, 요즘 어떻게 지냈어? 최근에 눈여겨보는 재밌는 일 있어?',
+        hints: [
+          { text: "Can't complain! I've been getting into photography lately.", korean: '나쁘지 않아! 요즘 사진 찍는 데 빠졌어.' },
+          { text: "It's been hectic, to be honest, so I'm craving a getaway.", korean: '솔직히 정신없어서 어디론가 떠나고 싶어.' },
+        ],
+      },
+    },
+    followUps: [
+      {
+        reply: "That sounds nice! What do you usually like to do when you have some free time?",
+        tr: '좋네요! 보통 시간 여유가 있을 땐 뭘 하면서 보내세요?',
+        tip: {
+          betterPhrase: 'In my free time, I usually unwind with music.',
+          koreanNote: '"unwind"를 쓰면 "긴장을 풀며 쉬다"라는 자연스러운 원어민 뉘앙스가 살아요!',
+        },
+        hints: [
+          { text: 'I usually watch movies or take a walk.', korean: '보통 영화를 보거나 산책해요.' },
+          { text: 'I love trying out new restaurants.', korean: '맛집 탐방하는 걸 좋아해요.' },
+        ],
+        vocab: {
+          word: 'unwind',
+          reading: '/ʌnˈwaɪnd/',
+          koreanPronunciation: '언와인드',
+          meaning: '긴장을 풀다, 편히 쉬다',
+          partOfSpeech: '회화 표현',
+          exampleTarget: 'I like to unwind with a cup of tea.',
+          exampleKorean: '차 한 잔 마시며 편히 쉬는 걸 좋아해요.',
+        },
+      },
+      {
+        reply: "Oh, I love that too! Have you done that recently, or is it something you're hoping to do soon?",
+        tr: '오, 저도 그거 정말 좋아해요! 최근에 해보셨나요, 아니면 조만간 하실 예정인가요?',
+        tip: {
+          betterPhrase: "I haven't had the chance lately, but I'd love to soon.",
+          koreanNote: '"haven\'t had the chance"는 "요즘 기회가 없었어요"라는 아주 실용적인 표현이에요.',
+        },
+        hints: [
+          { text: 'I actually did it last weekend!', korean: '사실 지난 주말에 했어요!' },
+          { text: "I'm hoping to do it this Saturday.", korean: '이번 토요일에 하려고 해요.' },
+        ],
+        vocab: {
+          word: 'have the chance',
+          reading: '/hæv ðə tʃæns/',
+          koreanPronunciation: '해브 더 챈스',
+          meaning: '~할 기회가 있다',
+          partOfSpeech: '회화 표현',
+          exampleTarget: "I hope you get the chance to visit.",
+          exampleKorean: '꼭 방문해 볼 기회가 있길 바라요.',
+        },
+      },
+    ],
+  },
+  cafe: {
+    opening: {
+      beginner: {
+        reply: 'Hi! Welcome to our cafe. What can I get for you?',
+        tr: '안녕하세요! 카페에 오신 걸 환영해요. 무엇으로 드릴까요?',
+        hints: [
+          { text: 'An iced latte, please.', korean: '아이스 라떼 한 잔 주세요.' },
+          { text: 'What is your popular drink?', korean: '인기 있는 음료가 뭐예요?' },
+        ],
+      },
+      intermediate: {
+        reply: 'Welcome in! What can I get started for you today? Our seasonal vanilla latte is really popular.',
+        tr: '어서 오세요! 오늘 어떤 음료로 준비해 드릴까요? 시즌 바닐라 라떼가 정말 인기 있어요.',
+        hints: [
+          { text: 'Could I get an iced oat latte, please?', korean: '아이스 오트 라떼로 주시겠어요?' },
+          { text: "I'll try the seasonal vanilla latte, less sweet.", korean: '시즌 바닐라 라떼 덜 달게 마셔볼게요.' },
+        ],
+      },
+      advanced: {
+        reply: "Hey there, welcome in! Can I get you started with a coffee, or would you like a moment to look over our seasonal specials?",
+        tr: '어서 오세요! 바로 커피부터 주문하시겠어요, 아니면 시즌 스페셜 메뉴를 조금 더 보시겠어요?',
+        hints: [
+          { text: "I'd love a cold brew with a splash of oat milk, for here.", korean: '오트 밀크 살짝 넣은 콜드브루로 먹고 갈게요.' },
+          { text: 'Could you recommend something not overly sweet?', korean: '너무 달지 않은 메뉴로 추천해 주실래요?' },
+        ],
+      },
+    },
+    followUps: [
+      {
+        reply: 'Great choice! Would you like that for here or to go? Any milk preference?',
+        tr: '좋은 선택이에요! 매장에서 드시겠어요, 포장해 드릴까요? 우유 변경도 가능해요.',
+        tip: {
+          betterPhrase: 'Could I have it to go with oat milk, please?',
+          koreanNote: '테이크아웃은 "to go" 또는 "takeaway"라고 말하면 바로 통해요.',
+        },
+        hints: [
+          { text: 'For here, please. Regular milk is fine.', korean: '먹고 갈게요. 일반 우유로 괜찮아요.' },
+          { text: 'To go, please! Can I get less ice?', korean: '포장이요! 얼음 적게 주실 수 있나요?' },
+        ],
+        vocab: {
+          word: 'for here or to go',
+          reading: '/fɔːr hɪr ɔːr tə ɡoʊ/',
+          koreanPronunciation: '포 히어 오어 투 고',
+          meaning: '매장 식사인지 포장인지',
+          partOfSpeech: '회화 표현',
+          exampleTarget: 'I will have it to go, please.',
+          exampleKorean: '포장으로 부탁드려요.',
+        },
+      },
+    ],
+  },
+  travel: {
+    opening: {
+      beginner: {
+        reply: 'Hello! Welcome to the hotel. Are you checking in?',
+        tr: '안녕하세요! 호텔에 오신 걸 환영합니다. 체크인하시나요?',
+        hints: [
+          { text: 'Yes, I have a reservation.', korean: '네, 예약했어요.' },
+          { text: 'Can I leave my bag here first?', korean: '가방을 먼저 맡길 수 있나요?' },
+        ],
+      },
+      intermediate: {
+        reply: 'Good afternoon! Welcome to Horizon Hotel. May I have your name for check-in?',
+        tr: '안녕하세요! 호라이즌 호텔에 오신 걸 환영합니다. 체크인 성함을 알려주시겠어요?',
+        hints: [
+          { text: "Hi, I'm checking in under Kim. Is an early check-in possible?", korean: '안녕하세요, 김으로 예약했어요. 얼리 체크인 가능한가요?' },
+          { text: 'Sure, here is my passport and booking confirmation.', korean: '네, 여기 여권과 예약 확인서예요.' },
+        ],
+      },
+      advanced: {
+        reply: "Good afternoon and welcome! I'd be happy to get you checked in—do you have your confirmation handy, or shall I look it up by name?",
+        tr: '안녕하세요, 환영합니다! 체크인 도와드릴게요. 예약 확인서가 있으신가요, 아니면 성함으로 조회해 드릴까요?',
+        hints: [
+          { text: "Here's my passport. By any chance, is a higher-floor room available?", korean: '여기 여권이에요. 혹시 고층 객실로 가능할까요?' },
+          { text: 'Could you also let me know what time breakfast starts?', korean: '조식 시작 시간도 알려주시겠어요?' },
+        ],
+      },
+    },
+    followUps: [
+      {
+        reply: 'All set! Here is your key card for room 804. Do you need directions to the elevator or any local tips?',
+        tr: '모두 완료됐습니다! 804호 키 카드입니다. 엘리베이터 위치나 주변 맛집 추천이 필요하신가요?',
+        tip: {
+          betterPhrase: 'Could you recommend a good restaurant nearby?',
+          koreanNote: '주변 추천을 물을 땐 "nearby"를 문장 끝에 붙이면 아주 자연스러워요.',
+        },
+        hints: [
+          { text: 'Yes, any good local restaurants nearby?', korean: '네, 근처에 현지 맛집 있나요?' },
+          { text: 'What is the Wi-Fi password?', korean: '와이파이 비밀번호가 뭔가요?' },
+        ],
+        vocab: {
+          word: 'check in',
+          reading: '/tʃek ɪn/',
+          koreanPronunciation: '체크 인',
+          meaning: '체크인하다, 투숙 등록하다',
+          partOfSpeech: '회화 표현',
+          exampleTarget: "I'd like to check in, please.",
+          exampleKorean: '체크인하고 싶습니다.',
+        },
+      },
+    ],
+  },
+  restaurant: {
+    opening: {
+      beginner: {
+        reply: 'Hello! Table for how many people today?',
+        tr: '안녕하세요! 오늘 몇 분이신가요?',
+        hints: [
+          { text: 'Table for two, please.', korean: '두 명 자리 부탁해요.' },
+          { text: 'Just one person, please.', korean: '혼자예요.' },
+        ],
+      },
+      intermediate: {
+        reply: 'Welcome! Do you have a reservation, or would you like a table by the window?',
+        tr: '어서 오세요! 예약하셨나요, 아니면 창가 자리로 안내해 드릴까요?',
+        hints: [
+          { text: 'No reservation, a window seat would be lovely!', korean: '예약은 안 했는데 창가 자리면 좋겠어요!' },
+          { text: 'Could we see the menu and start with some water?', korean: '메뉴판 주시고 물 먼저 부탁드릴게요.' },
+        ],
+      },
+      advanced: {
+        reply: "Good evening! Welcome in—we have a cozy booth or a patio table open. Which would you prefer, and can I bring you a drink while you browse?",
+        tr: '안녕하세요! 아늑한 부스석과 테라스 자리가 비어 있는데 어디가 좋으실까요? 메뉴 보시는 동안 음료 먼저 드릴까요?',
+        hints: [
+          { text: 'The patio sounds wonderful! Could you tell us your signature dish?', korean: '테라스 좋네요! 이곳 시그니처 메뉴가 뭔가요?' },
+          { text: "We'll take the booth. Also, I'm allergic to peanuts.", korean: '부스석으로 할게요. 그리고 제가 땅콩 알레르기가 있어요.' },
+        ],
+      },
+    },
+    followUps: [
+      {
+        reply: 'Right away! Our house pasta is a crowd favorite. Are you ready to order, or do you need a few more minutes?',
+        tr: '바로 준비해 드릴게요! 저희 하우스 파스타가 인기 최고예요. 지금 주문하시겠어요, 아니면 조금 더 보시겠어요?',
+        tip: {
+          betterPhrase: 'Could we have a couple more minutes, please?',
+          koreanNote: '조금 더 고민할 땐 "a couple more minutes"라고 하면 정중하고 자연스러워요.',
+        },
+        hints: [
+          { text: "I'll have the house pasta, please.", korean: '하우스 파스타로 할게요.' },
+          { text: 'Could we have a few more minutes?', korean: '몇 분만 더 봐도 될까요?' },
+        ],
+        vocab: {
+          word: 'crowd favorite',
+          reading: '/kraʊd ˈfeɪvərɪt/',
+          koreanPronunciation: '크라우드 페이버릿',
+          meaning: '모두가 좋아하는 인기 메뉴',
+          partOfSpeech: '회화 표현',
+          exampleTarget: 'The tiramisu here is a crowd favorite.',
+          exampleKorean: '여기 티라미수가 인기 메뉴예요.',
+        },
+      },
+    ],
+  },
+  business: {
+    opening: {
+      beginner: {
+        reply: 'Nice to meet you! Could you tell me a little about yourself?',
+        tr: '만나서 반갑습니다! 간단히 자기소개를 해주실 수 있나요?',
+        hints: [
+          { text: "Hi, I'm a product designer from Korea.", korean: '안녕하세요, 한국에서 온 프로덕트 디자이너예요.' },
+          { text: "Nice to meet you! I work in IT.", korean: '반갑습니다! 저는 IT 분야에서 일하고 있어요.' },
+        ],
+      },
+      intermediate: {
+        reply: 'Thanks for joining today! Before we dive in, could you briefly walk me through your current role?',
+        tr: '오늘 함께해 주셔서 감사합니다! 시작하기 전에 현재 맡고 계신 역할을 간단히 설명해 주실래요?',
+        hints: [
+          { text: 'Sure! I lead a small team working on mobile apps.', korean: '네! 모바일 앱을 만드는 작은 팀을 이끌고 있어요.' },
+          { text: "I'm currently focused on growing our global product.", korean: '현재 글로벌 서비스 성장에 집중하고 있어요.' },
+        ],
+      },
+      advanced: {
+        reply: "Great to connect with you today! To kick things off, what's been the most rewarding project you've tackled recently?",
+        tr: '오늘 뵙게 되어 반갑습니다! 먼저 최근 진행하신 프로젝트 중 가장 보람찼던 일은 무엇인가요?',
+        hints: [
+          { text: 'Recently, I spearheaded a product launch that cut latency in half.', korean: '최근 응답 속도를 절반으로 줄인 제품 출시를 주도했어요.' },
+          { text: 'I really enjoyed collaborating across teams to revamp our UX.', korean: '여러 팀과 협업해 UX를 개편한 작업이 정말 뜻깊었어요.' },
+        ],
+      },
+    },
+    followUps: [
+      {
+        reply: "That sounds impressive! What's one big goal you're aiming for over the next few months?",
+        tr: '정말 인상적이네요! 앞으로 몇 달 동안 목표로 삼고 있는 큰 계획이 있으신가요?',
+        tip: {
+          betterPhrase: "My main priority right now is sharpening my communication skills.",
+          koreanNote: '업무 목표를 말할 땐 "My main priority is~"로 시작하면 프로페셔널해 보여요.',
+        },
+        hints: [
+          { text: 'I want to communicate more smoothly with global clients.', korean: '글로벌 고객과 더 매끄럽게 소통하고 싶어요.' },
+          { text: 'My priority is launching our next major update.', korean: '다음 대규모 업데이트를 성공적으로 출시하는 게 목표예요.' },
+        ],
+        vocab: {
+          word: 'walk someone through',
+          reading: '/wɔːk θruː/',
+          koreanPronunciation: '워크 쓰루',
+          meaning: '차근차근 설명하다',
+          partOfSpeech: '회화 표현',
+          exampleTarget: 'Let me walk you through the plan.',
+          exampleKorean: '계획을 차근차근 설명해 드릴게요.',
+        },
+      },
+    ],
+  },
+  custom: {
+    opening: {
+      beginner: {
+        reply: "Let's practice this topic together! What would you like to say first?",
+        tr: '이 주제로 같이 연습해 봐요! 먼저 어떤 말로 시작해 볼까요?',
+        hints: [
+          { text: 'Hi! Can you help me with something?', korean: '안녕하세요! 좀 도와주실 수 있나요?' },
+          { text: 'I want to practice everyday expressions.', korean: '일상 표현을 연습하고 싶어요.' },
+        ],
+      },
+      intermediate: {
+        reply: "Awesome topic! Let's jump right into the roleplay—how would you kick off the conversation?",
+        tr: '멋진 주제네요! 바로 상황극 시작해 볼까요? 어떻게 첫 마디를 꺼내시겠어요?',
+        hints: [
+          { text: 'Excuse me, do you have a minute?', korean: '실례지만 잠깐 시간 괜찮으세요?' },
+          { text: "Hi! I'd love to talk about this topic.", korean: '안녕하세요! 이 주제로 이야기해 보고 싶어요.' },
+        ],
+      },
+      advanced: {
+        reply: "Love that scenario—I'm fully in character! Go ahead and set the stage however you'd like.",
+        tr: '정말 좋은 시나리오예요, 바로 몰입할게요! 원하시는 대로 먼저 상황을 열어 주세요.',
+        hints: [
+          { text: "Thanks for making time—I wanted to discuss something important.", korean: '시간 내주셔서 감사해요, 중요한 이야기를 나누고 싶었어요.' },
+          { text: 'Hey, I was curious about your take on this.', korean: '안녕, 이 문제에 대한 네 생각이 궁금했어.' },
+        ],
+      },
+    },
+    followUps: [
+      {
+        reply: 'Nice start! Could you tell me a bit more about what you have in mind?',
+        tr: '좋은 시작이에요! 생각하고 계신 걸 조금 더 자세히 말씀해 주실래요?',
+        tip: {
+          betterPhrase: "What I have in mind is something simple and practical.",
+          koreanNote: '"have in mind"는 "염두에 두다, 생각하고 있다"라는 유용한 회화 표현이에요.',
+        },
+        hints: [
+          { text: "Sure, here's what I'm thinking...", korean: '네, 제가 생각하는 건...' },
+          { text: 'Could you give me a recommendation?', korean: '추천 좀 해주시겠어요?' },
+        ],
+        vocab: {
+          word: 'have in mind',
+          reading: '/hæv ɪn maɪnd/',
+          koreanPronunciation: '해브 인 마인드',
+          meaning: '염두에 두다, 생각해 두다',
+          partOfSpeech: '회화 표현',
+          exampleTarget: 'Do you have a place in mind for dinner?',
+          exampleKorean: '저녁 먹을 곳 생각해 둔 데 있어요?',
+        },
+      },
+    ],
+  },
+};
+
+const DEMO_JA_OPENING: Record<ConversationScenarioId, { reply: string; tr: string; hints: SuggestedReply[] }> = {
+  free_talk: {
+    reply: 'こんにちは！今日はどんな一日でしたか？',
+    tr: '안녕하세요! 오늘은 어떤 하루였나요?',
+    hints: [
+      { text: 'とても楽しかったです！', korean: '정말 즐거웠어요!' },
+      { text: 'ちょっと忙しかったです。', korean: '조금 바빴어요.' },
+    ],
+  },
+  cafe: {
+    reply: 'いらっしゃいませ！ご注文はお決まりですか？',
+    tr: '어서 오세요! 주문은 결정하셨나요?',
+    hints: [
+      { text: 'アイスラテを一つお願いします。', korean: '아이스 라떼 한 잔 부탁드려요.' },
+      { text: 'おすすめは何ですか？', korean: '추천 메뉴가 뭐예요?' },
+    ],
+  },
+  travel: {
+    reply: 'いらっしゃいませ。チェックインでしょうか？',
+    tr: '어서 오세요. 체크인이신가요?',
+    hints: [
+      { text: 'はい、予約しています。', korean: '네, 예약했습니다.' },
+      { text: '荷物を預けられますか？', korean: '짐을 맡길 수 있나요?' },
+    ],
+  },
+  restaurant: {
+    reply: 'いらっしゃいませ！何名様でしょうか？',
+    tr: '어서 오세요! 몇 분이신가요?',
+    hints: [
+      { text: '二人です。', korean: '두 명이에요.' },
+      { text: 'メニューを見せてください。', korean: '메뉴판 좀 보여주세요.' },
+    ],
+  },
+  business: {
+    reply: 'はじめまして！簡単に自己紹介をお願いできますか？',
+    tr: '처음 뵙겠습니다! 간단히 자기소개 부탁드릴까요?',
+    hints: [
+      { text: '韓国から来ました。ITの仕事をしています。', korean: '한국에서 왔습니다. IT 일을 하고 있어요.' },
+      { text: 'よろしくお願いします！', korean: '잘 부탁드립니다!' },
+    ],
+  },
+  custom: {
+    reply: 'いいテーマですね！さっそく話してみましょう。',
+    tr: '좋은 주제네요! 바로 이야기해 볼까요?',
+    hints: [
+      { text: 'すみません、少し聞いてもいいですか？', korean: '실례지만 잠깐 여쭤봐도 될까요?' },
+      { text: '自然な表現を練習したいです。', korean: '자연스러운 표현을 연습하고 싶어요.' },
+    ],
+  },
+};
+
+export function runDemoConversationTurn(params: {
+  scenarioId: ConversationScenarioId;
+  language: TargetLanguageCode;
+  level: ProficiencyLevel;
+  turnCount: number;
+  userText?: string;
+  isOpening?: boolean;
+}): DemoConversationReply {
+  const { scenarioId, language, level, turnCount, userText, isOpening } = params;
+
+  if (language === 'ja') {
+    if (isOpening) {
+      const ja = DEMO_JA_OPENING[scenarioId];
+      return {
+        replyText: ja.reply,
+        koreanTranslation: ja.tr,
+        suggestedReplies: ja.hints,
+        vocabCards: [],
+      };
+    }
+    return {
+      userTranscript: userText || '🎙️ 음성 답변',
+      replyText: 'いいですね！もう少し詳しく教えてくれますか？',
+      koreanTranslation: '좋네요! 조금 더 자세히 알려주실래요?',
+      coachingTip: {
+        betterPhrase: 'とてもよかったです！',
+        koreanNote: '정중하고 밝게 반응할 때 "とてもよかったです"를 쓰면 자연스러워요.',
+      },
+      suggestedReplies: [
+        { text: 'もちろんです！', korean: '물론이죠!' },
+        { text: 'おすすめを教えてください。', korean: '추천 좀 해주세요.' },
+      ],
+      vocabCards: [
+        {
+          word: 'もう少し詳しく',
+          reading: 'もうすこしくわしく (mō sukoshi kuwashiku)',
+          koreanPronunciation: '모오 스코시 쿠와시쿠',
+          meaning: '조금 더 자세히',
+          partOfSpeech: '회화 표현',
+          exampleTarget: 'もう少し詳しく教えてください。',
+          exampleKorean: '조금 더 자세히 알려주세요.',
+        },
+      ],
+    };
+  }
+
+  const preset = DEMO_CHAT_EN[scenarioId];
+  if (isOpening) {
+    const opener = preset.opening[level];
+    return {
+      replyText: opener.reply,
+      koreanTranslation: opener.tr,
+      suggestedReplies: opener.hints,
+      vocabCards: [],
+    };
+  }
+
+  const follow = preset.followUps[turnCount % preset.followUps.length];
+  return {
+    userTranscript: userText || '🎙️ 음성 답변',
+    replyText: follow.reply,
+    koreanTranslation: follow.tr,
+    coachingTip: follow.tip,
+    suggestedReplies: follow.hints,
+    vocabCards: [follow.vocab],
+  };
 }

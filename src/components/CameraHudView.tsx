@@ -7,6 +7,7 @@ import {
   Gamepad2,
   ImagePlus,
   Keyboard,
+  MessageCircle,
   Mic,
   RefreshCw,
   Send,
@@ -60,6 +61,7 @@ interface CameraHudViewProps {
   onToggleSaveCard: (card: SavedVocabCard) => void;
   onOpenVocabBank: () => void;
   onOpenPopper: () => void;
+  onOpenChat: () => void;
   onOpenHistory: () => void;
   onOpenSettings: () => void;
 }
@@ -88,6 +90,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
   onToggleSaveCard,
   onOpenVocabBank,
   onOpenPopper,
+  onOpenChat,
   onOpenHistory,
   onOpenSettings,
 }) => {
@@ -470,6 +473,55 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
           overflowX: 'auto',
         }}
       >
+        {/* 1-Tap Mode Switcher: Scan vs Conversation */}
+        <div
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            padding: '2px',
+            borderRadius: '9999px',
+            background: 'rgba(15, 23, 42, 0.78)',
+            border: '1px solid rgba(255, 255, 255, 0.16)',
+            flexShrink: 0,
+          }}
+        >
+          <button
+            type="button"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+              padding: '4px 9px',
+              borderRadius: '9999px',
+              fontSize: '11.5px',
+              fontWeight: 800,
+              background: 'linear-gradient(135deg, rgba(56,189,248,0.34), rgba(99,102,241,0.34))',
+              color: '#E0F2FE',
+              border: '1px solid rgba(56, 189, 248, 0.55)',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <Camera size={12} /> 스캔
+          </button>
+          <button
+            type="button"
+            onClick={onOpenChat}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+              padding: '4px 10px',
+              borderRadius: '9999px',
+              fontSize: '11.5px',
+              fontWeight: 700,
+              color: 'var(--text-secondary)',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            <MessageCircle size={12} /> 회화
+          </button>
+        </div>
+
         {settings.demoMode && (
           <span
             className="glass-pill"
