@@ -47,11 +47,11 @@ export const DEFAULT_SETTINGS: AppSettings = {
   persona: 'buddy',
   level: 'beginner',
   customPersonaPrompt: '',
-  tutorModel: 'gemini-3.5-flash-lite',
+  tutorModel: 'gemini-3.1-flash-lite',
   ttsPreference: 'hybrid',
   autoPlayTts: true,
   vocabPopperBestScore: 0,
-  settingsVersion: 2,
+  settingsVersion: 3,
 };
 
 export function loadSettings(): AppSettings {
@@ -63,10 +63,10 @@ export function loadSettings(): AppSettings {
       ...DEFAULT_SETTINGS,
       ...parsed,
     };
-    // One-time migration for v1 users whose localStorage defaulted to slower gemini-3.8-flash
-    if ((parsed.settingsVersion ?? 1) < 2) {
-      merged.tutorModel = 'gemini-3.5-flash-lite';
-      merged.settingsVersion = 2;
+    // Migrate existing users to fastest gemini-3.1-flash-lite for <10s real-time target
+    if ((parsed.settingsVersion ?? 1) < 3) {
+      merged.tutorModel = 'gemini-3.1-flash-lite';
+      merged.settingsVersion = 3;
       localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
     }
     return merged;

@@ -178,29 +178,91 @@ export interface ParsedStreamReply {
   userTranscript?: string;
   segments: ReplySegment[];
   plainText: string;
+  /** True as soon as the spoken reply ends and inline W: card lines begin streaming. */
+  replyReady: boolean;
+  inlineCards: ExtractedVocab[];
+}
+
+function parseInlineCardLine(line: string): ExtractedVocab | null {
+  const payload = line.replace(/^W:\s*/i, '').trim();
+  const cols = payload.split('|').map((c) => stripByteFallback(c));
+  if (cols.length < 3) return null;
+  const word = cols[0];
+  const readingOrPron = cols[1];
+  const meaning = cols[2];
+  if (!word || !meaning) return null;
+
+  const exampleTarget = cols[3] || word;
+  const exampleKorean = cols[4] || meaning;
+  let box2d: Box2D | undefined;
+  if (cols[5]) {
+    const nums = cols[5]
+      .replace(/[\[\]]/g, '')
+      .split(',')
+      .map((s) => Number(s.trim()));
+    box2d = sanitizeBox2d(nums);
+  }
+
+  return {
+    word,
+    reading: readingOrPron || word,
+    koreanPronunciation: readingOrPron || '',
+    meaning,
+    partOfSpeech: '표현',
+    exampleTarget,
+    exampleKorean,
+    box2d,
+  };
 }
 
 /**
- * Incrementally parses Pass 1 streaming tutor text with optional leading `Q: ...` line
- * and inline `<t>target phrase</t>` markers, safely stripping partial trailing tags.
+ * Incrementally parses single-stream tutor output:
+ *   Optional line 1: `Q: <transcript>`
+ *   Reply text with `<t>target phrase</t>` markers
+ *   Optional trailing lines: `W: word | pron | meaning | exTarget | exKo | ymin,xmin,ymax,xmax`
+ * Never flashes incomplete `<t`, `</t`, or `W:` metadata in the spoken caption.
  */
 export function parseStreamingReply(raw: string): ParsedStreamReply {
-  const cleaned = raw.replace(/<0x[0-9A-Fa-f]{2}>/g, '');
+  const cleaned = raw.replace(/<0x[0-9A-Fa-f]{2}>/g, '').replace(/\r\n/g, '\n');
   let userTranscript: string | undefined;
-  let body = cleaned;
+  let rest = cleaned.trimStart();
 
-  const trimmedLead = cleaned.trimStart();
-  if (/^Q:/i.test(trimmedLead)) {
-    const nl = trimmedLead.indexOf('\n');
+  if (/^Q:/i.test(rest)) {
+    const nl = rest.indexOf('\n');
     if (nl === -1) {
       return {
-        userTranscript: trimmedLead.replace(/^Q:\s*/i, '').trim(),
+        userTranscript: rest.replace(/^Q:\s*/i, '').trim(),
         segments: [],
         plainText: '',
+        replyReady: false,
+        inlineCards: [],
       };
     }
-    userTranscript = trimmedLead.slice(0, nl).replace(/^Q:\s*/i, '').trim();
-    body = trimmedLead.slice(nl + 1).trimStart();
+    userTranscript = rest.slice(0, nl).replace(/^Q:\s*/i, '').trim();
+    rest = rest.slice(nl + 1).trimStart();
+  }
+
+  // Split spoken reply from trailing inline `W:` vocab card lines
+  let replyReady = false;
+  let body = rest;
+  const inlineCards: ExtractedVocab[] = [];
+
+  const cardSectionMatch = rest.match(/(?:^|\n)W:/i);
+  if (cardSectionMatch && cardSectionMatch.index !== undefined) {
+    replyReady = true;
+    const splitIdx = cardSectionMatch.index;
+    body = rest.slice(0, splitIdx).trimEnd();
+    const cardSection = rest.slice(splitIdx).trim();
+    for (const line of cardSection.split('\n')) {
+      const trimmed = line.trim();
+      if (/^W:/i.test(trimmed)) {
+        const parsed = parseInlineCardLine(trimmed);
+        if (parsed) inlineCards.push(parsed);
+      }
+    }
+  } else {
+    // Strip partial trailing `\nW` before `:` arrives so it never flashes in caption
+    body = body.replace(/\nW$/i, '');
   }
 
   // Strip any incomplete trailing tag prefix like "<", "<t", "</", "</t"
@@ -244,5 +306,7 @@ export function parseStreamingReply(raw: string): ParsedStreamReply {
     userTranscript,
     segments,
     plainText: segments.map((s) => s.text).join(''),
+    replyReady,
+    inlineCards: inlineCards.slice(0, 3),
   };
 }

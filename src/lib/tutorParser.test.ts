@@ -37,12 +37,13 @@ describe('tutorParser', () => {
     expect(parsed.vocabCards[0].box2d).toEqual([0, 200, 1000, 750]);
   });
 
-  it('parses streaming replies with Q: line, <t> spans, and mid-stream partial tags', () => {
+  it('parses streaming replies with Q: line, <t> spans, partial tags, and inline W: cards', () => {
     const stillTypingQ = parseStreamingReply('Q: 이거 영어로');
     expect(stillTypingQ.userTranscript).toBe('이거 영어로');
     expect(stillTypingQ.segments).toEqual([]);
+    expect(stillTypingQ.replyReady).toBe(false);
 
-    const midStream = parseStreamingReply('Q: 이거 뭐예요?\n이건 <t>Rubik\'s Cube</t>라고 해요. <t>Twist it</');
+    const midStream = parseStreamingReply("Q: 이거 뭐예요?\n이건 <t>Rubik's Cube</t>라고 해요. <t>Twist it</");
     expect(midStream.userTranscript).toBe('이거 뭐예요?');
     expect(midStream.segments).toEqual([
       { text: '이건 ', isTarget: false },
@@ -51,6 +52,17 @@ describe('tutorParser', () => {
       { text: 'Twist it', isTarget: true },
     ]);
     expect(midStream.plainText).toBe("이건 Rubik's Cube라고 해요. Twist it");
+    expect(midStream.replyReady).toBe(false);
+
+    const withCard = parseStreamingReply(
+      "이건 <t>Jack-o'-lantern</t>이에요!\nW: Jack-o'-lantern | 잭오랜턴 | 할로윈 호박 등 | Cute jack-o'-lantern! | 귀여운 호박 등이야! | 350,280,620,680",
+    );
+    expect(withCard.replyReady).toBe(true);
+    expect(withCard.plainText).toBe("이건 Jack-o'-lantern이에요!");
+    expect(withCard.inlineCards).toHaveLength(1);
+    expect(withCard.inlineCards[0].word).toBe("Jack-o'-lantern");
+    expect(withCard.inlineCards[0].koreanPronunciation).toBe('잭오랜턴');
+    expect(withCard.inlineCards[0].box2d).toEqual([350, 280, 620, 680]);
   });
 
   it('parses Pass 2 vocab-cards-only JSON cleanly', () => {

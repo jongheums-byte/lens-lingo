@@ -336,11 +336,16 @@ export const App: React.FC = () => {
         return;
       }
 
-      // Live Gemini 2-Pass Streaming Pipeline
-      // Only chain previousInteractionId for explicit follow-up questions (text/voice);
-      // fresh 1-tap scans start clean so old camera frames don't accumulate and slow down requests.
+      // Live Gemini Single-Stream Fast Pipeline (<10s cut):
+      // Streams spoken reply first, fires TTS as soon as reply finishes (even before inline W: cards end),
+      // and extracts sticker cards from inline W: lines with ZERO second image upload or extra LLM call!
       const isFollowUpQuestion = Boolean(params.textQuestion?.trim() || params.audioBase64);
+      const lastTutorText = isFollowUpQuestion
+        ? [...baseSession.messages].reverse().find((m) => m.role === 'tutor')?.text
+        : undefined;
       const imgParts = dataUrlToBase64Parts(params.imageDataUrl);
+      let ttsStartedEarly = false;
+
       const streamRes = await streamTutorReply({
         settings,
         imageBase64: imgParts.base64,
@@ -348,7 +353,7 @@ export const App: React.FC = () => {
         audioBase64: params.audioBase64,
         audioMimeType: params.audioMimeType,
         textQuestion: params.textQuestion,
-        previousInteractionId: isFollowUpQuestion ? baseSession.previousInteractionId : undefined,
+        previousReplyContext: lastTutorText,
         signal: turnAbortController.signal,
         onStage: (stage) => {
           if (turnSeq === turnSeqRef.current) setProcessingStage(stage);
@@ -367,27 +372,49 @@ export const App: React.FC = () => {
             },
           );
         },
+        onReplyReady: (partial) => {
+          if (turnSeq !== turnSeqRef.current || ttsStartedEarly || !settings.autoPlayTts) return;
+          if (partial.segments.length > 0 && partial.plainText.trim()) {
+            ttsStartedEarly = true;
+            playTutorSegments(
+              {
+                ...streamingTutorMsg,
+                text: partial.plainText,
+                segments: partial.segments,
+              },
+              settings,
+            );
+          }
+        },
       });
 
       const finalUserMsg: ChatMessage = {
         ...initialUserMsg,
         text: streamRes.userTranscript,
       };
+      const firstCardSummary =
+        streamRes.inlineCards.length > 0
+          ? `${streamRes.inlineCards[0].word} = ${streamRes.inlineCards[0].meaning}`
+          : undefined;
       const pass1TutorMsg: ChatMessage = {
         ...streamingTutorMsg,
         text: streamRes.plainText,
         segments: streamRes.segments,
+        translationSummary: firstCardSummary,
         latencyMs: streamRes.totalMs,
       };
       const nextInteractionId = streamRes.interactionId || baseSession.previousInteractionId;
 
+      const hasInlineCards = streamRes.inlineCards.length > 0;
+
       if (turnSeq === turnSeqRef.current) {
         upsertTurnMessages(finalUserMsg, pass1TutorMsg, nextInteractionId);
         setIsProcessing(false);
-        setIsExtractingCards(true);
-        setRecentTrayCards([]);
-        if (settings.autoPlayTts) {
-          // Kick off Streaming PCM TTS immediately in parallel with Pass 2!
+        if (!hasInlineCards) {
+          setIsExtractingCards(true);
+          setRecentTrayCards([]);
+        }
+        if (settings.autoPlayTts && !ttsStartedEarly) {
           playTutorSegments(pass1TutorMsg, settings);
         }
       }
@@ -405,17 +432,23 @@ export const App: React.FC = () => {
       await putSession(pass1Session);
       setSessions((prev) => [pass1Session, ...prev.filter((s) => s.id !== pass1Session.id)]);
 
-      // Pass 2 (Background): Extract vocab cards + box2d and crop die-cut stickers
-      const pass2 = await extractVocabCardsAsync({
-        settings,
-        replyText: streamRes.plainText,
-        imageBase64: imgParts.base64,
-        imageMimeType: imgParts.mimeType,
-        signal: turnAbortController.signal,
-      });
+      // Use zero-cost inline W: cards if emitted; only call Pass 2 fallback if none arrived
+      let extractedVocab = streamRes.inlineCards;
+      let summaryText = firstCardSummary || '';
+      if (!hasInlineCards) {
+        const pass2 = await extractVocabCardsAsync({
+          settings,
+          replyText: streamRes.plainText,
+          imageBase64: imgParts.base64,
+          imageMimeType: imgParts.mimeType,
+          signal: turnAbortController.signal,
+        });
+        extractedVocab = pass2.vocabCards;
+        summaryText = pass2.translationSummary || summaryText;
+      }
 
       const newCards: SavedVocabCard[] = await Promise.all(
-        pass2.vocabCards.map(async (vc, idx) => {
+        extractedVocab.map(async (vc, idx) => {
           const stickerDataUrl = await createStickerDataUrlFromImage(
             params.imageDataUrl,
             vc.box2d,
@@ -453,9 +486,9 @@ export const App: React.FC = () => {
 
       const finalTutorMsg: ChatMessage = {
         ...pass1TutorMsg,
-        translationSummary: pass2.translationSummary || pass1TutorMsg.translationSummary,
+        translationSummary: summaryText || pass1TutorMsg.translationSummary,
         vocabCardIds: newCards.map((c) => c.id),
-        extractedCards: pass2.vocabCards,
+        extractedCards: extractedVocab,
       };
       const finalSession: LearningSession = {
         ...pass1Session,

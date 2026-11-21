@@ -6,7 +6,7 @@ export type ProficiencyLevel = 'beginner' | 'intermediate' | 'advanced';
 
 export type TtsPreference = 'hybrid' | 'gemini_expressive' | 'browser_fast';
 
-export type TutorModelId = 'gemini-3.8-flash' | 'gemini-3.5-flash-lite';
+export type TutorModelId = 'gemini-3.1-flash-lite' | 'gemini-3.5-flash-lite' | 'gemini-3.8-flash';
 
 export interface ReplySegment {
   text: string;

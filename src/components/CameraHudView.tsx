@@ -202,7 +202,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
 
     if (cameraReady && videoRef.current && videoRef.current.videoWidth > 0) {
       const vid = videoRef.current;
-      const maxDim = 512;
+      const maxDim = 480;
       const ratio = Math.min(1, maxDim / Math.max(vid.videoWidth, vid.videoHeight));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(vid.videoWidth * ratio);
@@ -210,7 +210,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
-        return canvas.toDataURL('image/jpeg', 0.68);
+        return canvas.toDataURL('image/jpeg', 0.62);
       }
     }
 
@@ -533,30 +533,38 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
           <button
             type="button"
             className="glass-pill"
-            onClick={() =>
-              onUpdateSettings({
-                ...settings,
-                tutorModel:
-                  settings.tutorModel === 'gemini-3.5-flash-lite'
-                    ? 'gemini-3.8-flash'
-                    : 'gemini-3.5-flash-lite',
-              })
-            }
+            onClick={() => {
+              const order: AppSettings['tutorModel'][] = [
+                'gemini-3.1-flash-lite',
+                'gemini-3.5-flash-lite',
+                'gemini-3.8-flash',
+              ];
+              const nextModel = order[(order.indexOf(settings.tutorModel) + 1) % order.length];
+              onUpdateSettings({ ...settings, tutorModel: nextModel });
+            }}
             style={{
               padding: '4px 10px',
               fontSize: '11.5px',
               flexShrink: 0,
               background:
-                settings.tutorModel === 'gemini-3.5-flash-lite'
-                  ? 'rgba(56, 189, 248, 0.2)'
-                  : 'rgba(167, 139, 250, 0.2)',
+                settings.tutorModel === 'gemini-3.1-flash-lite'
+                  ? 'rgba(52, 211, 153, 0.22)'
+                  : settings.tutorModel === 'gemini-3.5-flash-lite'
+                    ? 'rgba(56, 189, 248, 0.2)'
+                    : 'rgba(167, 139, 250, 0.2)',
               borderColor:
-                settings.tutorModel === 'gemini-3.5-flash-lite'
-                  ? 'rgba(56, 189, 248, 0.5)'
-                  : 'rgba(167, 139, 250, 0.5)',
+                settings.tutorModel === 'gemini-3.1-flash-lite'
+                  ? 'rgba(52, 211, 153, 0.55)'
+                  : settings.tutorModel === 'gemini-3.5-flash-lite'
+                    ? 'rgba(56, 189, 248, 0.5)'
+                    : 'rgba(167, 139, 250, 0.5)',
             }}
           >
-            {settings.tutorModel === 'gemini-3.5-flash-lite' ? '⚡ 3.5 Lite' : '🎯 3.8 Flash'}
+            {settings.tutorModel === 'gemini-3.1-flash-lite'
+              ? '⚡ 3.1 초고속'
+              : settings.tutorModel === 'gemini-3.5-flash-lite'
+                ? '⚡ 3.5 Lite'
+                : '🎯 3.8 Flash'}
           </button>
         )}
 
@@ -693,16 +701,38 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
           <div style={{ fontSize: '12px', fontWeight: 700, color: 'var(--text-secondary)' }}>
             응답 속도 / AI 모델
           </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '6px' }}>
+            <button
+              type="button"
+              onClick={() =>
+                onUpdateSettings({ ...settings, tutorModel: 'gemini-3.1-flash-lite' })
+              }
+              style={{
+                padding: '7px 4px',
+                borderRadius: '10px',
+                fontSize: '11.5px',
+                fontWeight: 700,
+                background:
+                  settings.tutorModel === 'gemini-3.1-flash-lite'
+                    ? 'rgba(52, 211, 153, 0.24)'
+                    : 'rgba(255,255,255,0.05)',
+                border:
+                  settings.tutorModel === 'gemini-3.1-flash-lite'
+                    ? '1px solid #34D399'
+                    : '1px solid rgba(255,255,255,0.08)',
+              }}
+            >
+              ⚡ 3.1 초고속
+            </button>
             <button
               type="button"
               onClick={() =>
                 onUpdateSettings({ ...settings, tutorModel: 'gemini-3.5-flash-lite' })
               }
               style={{
-                padding: '8px',
+                padding: '7px 4px',
                 borderRadius: '10px',
-                fontSize: '12px',
+                fontSize: '11.5px',
                 fontWeight: 700,
                 background:
                   settings.tutorModel === 'gemini-3.5-flash-lite'
@@ -714,7 +744,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
                     : '1px solid rgba(255,255,255,0.08)',
               }}
             >
-              ⚡ 초고속 3.5 Lite
+              ⚡ 3.5 Lite
             </button>
             <button
               type="button"
@@ -722,9 +752,9 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
                 onUpdateSettings({ ...settings, tutorModel: 'gemini-3.8-flash' })
               }
               style={{
-                padding: '8px',
+                padding: '7px 4px',
                 borderRadius: '10px',
-                fontSize: '12px',
+                fontSize: '11.5px',
                 fontWeight: 700,
                 background:
                   settings.tutorModel === 'gemini-3.8-flash'
@@ -736,7 +766,7 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
                     : '1px solid rgba(255,255,255,0.08)',
               }}
             >
-              🎯 고정확 3.8 Flash
+              🎯 3.8 Flash
             </button>
           </div>
         </div>
@@ -852,7 +882,13 @@ export const CameraHudView: React.FC<CameraHudViewProps> = ({
                 }}
               >
                 {isProcessing
-                  ? `${settings.tutorModel === 'gemini-3.5-flash-lite' ? '⚡ 3.5 Lite' : '🎯 3.8 Flash'} 분석 중`
+                  ? `${
+                      settings.tutorModel === 'gemini-3.1-flash-lite'
+                        ? '⚡ 3.1 초고속'
+                        : settings.tutorModel === 'gemini-3.5-flash-lite'
+                          ? '⚡ 3.5 Lite'
+                          : '🎯 3.8 Flash'
+                    } 분석 중`
                   : latestTutorMsg.translationSummary}
               </span>
 

@@ -36,6 +36,7 @@ export interface AskTutorParams {
   audioMimeType?: string;
   textQuestion?: string;
   previousInteractionId?: string;
+  previousReplyContext?: string;
   signal?: AbortSignal;
 }
 
@@ -48,6 +49,7 @@ export interface StreamTutorResult {
   userTranscript: string;
   segments: ReplySegment[];
   plainText: string;
+  inlineCards: ExtractedVocab[];
   interactionId?: string;
   ttftMs: number;
   totalMs: number;
@@ -66,7 +68,7 @@ export class GeminiHttpError extends Error {
 }
 
 export function getFastThinkingLevel(model: TutorModelId): 'minimal' | 'low' {
-  return model === 'gemini-3.5-flash-lite' ? 'minimal' : 'low';
+  return model === 'gemini-3.8-flash' ? 'low' : 'minimal';
 }
 
 function extractApiErrorDetail(status: number, rawBody: string): string {
@@ -89,7 +91,7 @@ function extractApiErrorDetail(status: number, rawBody: string): string {
   }
 
   if (status === 429) {
-    return `무료 요청 한도 초과(429): 잠시 후 다시 시도하거나 설정에서 모델을 변경해 주세요.${detail ? ` (${detail})` : ''}`;
+    return `무료 요청 한도 초과(429): 잠시 후 다시 시도하거나 모델을 변경해 주세요.${detail ? ` (${detail})` : ''}`;
   }
   if (status === 401 || status === 403) {
     return `API 키 인증 오류(${status}): 설정에서 Gemini API 키를 확인해 주세요.${detail ? ` (${detail})` : ''}`;
@@ -111,9 +113,6 @@ export function formatGeminiError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/**
- * Links an optional external AbortSignal with a hard timeout AbortController.
- */
 function createTimedController(timeoutMs: number, externalSignal?: AbortSignal): {
   controller: AbortController;
   didTimeout: () => boolean;
@@ -151,7 +150,7 @@ async function fetchInteractionJson(
   body: Record<string, unknown>,
   options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<Record<string, unknown>> {
-  const { timeoutMs = 12000, signal } = options;
+  const { timeoutMs = 10000, signal } = options;
   const timed = createTimedController(timeoutMs, signal);
 
   try {
@@ -173,7 +172,7 @@ async function fetchInteractionJson(
     return JSON.parse(text) as Record<string, unknown>;
   } catch (err) {
     if (timed.didTimeout()) {
-      throw new Error(`응답 시간 초과 (${Math.round(timeoutMs / 1000)}초) — 네트워크 상태를 확인하고 다시 시도해 주세요.`);
+      throw new Error(`응답 시간 초과 (${Math.round(timeoutMs / 1000)}초) — 다시 시도해 주세요.`);
     }
     throw err;
   } finally {
@@ -192,50 +191,45 @@ function buildSystemInstruction(settings: AppSettings): string {
     .replaceAll('{LEARN_LANGUAGE}', lang.englishName);
 
   return `${resolvedPersona}
-
-Teaching Level: ${level.koreanLabel} (${settings.level}). ${level.promptRule}
-
-Strict Response & Output Rules:
-1. Respond in natural Korean mixed with short, directly usable ${lang.englishName} (${lang.nativeName}) target words or phrases.
-2. Keep the entire reply concise: strictly 1 to 3 short sentences total.
-3. Split your reply cleanly into \`replySegments\`. Mark EVERY ${lang.englishName} phrase with \`isTarget: true\` and EVERY Korean explanation/particle with \`isTarget: false\`. Never put both Korean and ${lang.englishName} inside the same segment.
-4. For \`vocabCards\`, pick 1 to 3 focal items from the photo or conversation. Provide \`reading\` as ${lang.readingGuideInstruction}, plus easy-to-read \`koreanPronunciation\` in Hangul.
-5. Whenever an image is provided, populate \`box2d\` as [ymin, xmin, ymax, xmax] normalized from 0 to 1000 tightly wrapping each corresponding object in the photo.
-6. If audio is provided, transcribe what the student said (even if mixed Korean + ${lang.englishName}) into \`userTranscript\`.`;
+Level: ${level.koreanLabel}. ${level.promptRule}
+Reply in 1-2 short sentences mixing Korean and ${lang.englishName}, extract 1-2 vocabCards with ${lang.readingGuideInstruction}, Korean pronunciation, and [ymin,xmin,ymax,xmax] 0-1000 box2d.`;
 }
 
-function buildStreamingSystemInstruction(settings: AppSettings, hasAudio: boolean): string {
+/**
+ * Ultra-compact single-stream prompt:
+ * Emits spoken reply first (with <t>target</t> tags), then 1-2 compact `W:` card lines.
+ * Eliminates the slow Pass 2 LLM roundtrip & duplicate image upload!
+ */
+function buildFastSingleStreamInstruction(settings: AppSettings, hasAudio: boolean): string {
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
   const level = PROFICIENCY_LEVELS[settings.level];
   const persona = PERSONAS[settings.persona];
 
-  const template = settings.customPersonaPrompt.trim() || persona.defaultPromptTemplate;
-  const resolvedPersona = template
-    .replaceAll('{MAIN_LANGUAGE}', 'Korean')
-    .replaceAll('{LEARN_LANGUAGE}', lang.englishName);
+  const custom = settings.customPersonaPrompt.trim();
+  const personaLine = custom
+    ? custom.replaceAll('{MAIN_LANGUAGE}', 'Korean').replaceAll('{LEARN_LANGUAGE}', lang.englishName)
+    : `You are ${persona.name} (${persona.koreanTitle}), a concise ${lang.englishName} tutor for a Korean learner (${level.koreanLabel}).`;
 
-  const audioPrefixRule = hasAudio
-    ? `Start with ONE short first line "Q: <what the student said>" then a newline, then your reply.`
-    : `Output ONLY the reply immediately without any preamble.`;
+  const qRule = hasAudio ? `Line 1: "Q: <what user said>"\n` : '';
 
-  return `${resolvedPersona}
-
-Teaching Level: ${level.koreanLabel} (${settings.level}). ${level.promptRule}
-
-Fast Real-Time Tutoring Rules:
-1. ${audioPrefixRule}
-2. Reply in natural Korean mixed with practical ${lang.englishName} (${lang.nativeName}) phrases.
-3. Keep it crisp and spoken-friendly: strictly 1 to 2 short sentences total.
-4. Wrap EVERY ${lang.englishName} word or phrase in <t>...</t> tags (e.g. 이건 <t>Rubik's Cube</t>예요. <t>Can I try it?</t>처럼 말해보세요!). Never nest tags and never output JSON.`;
+  return `${personaLine}
+Output strictly in this fast format (NO markdown, NO JSON):
+${qRule}Reply (1-2 short spoken sentences in Korean; wrap EVERY ${lang.englishName} phrase in <t>...</t>).
+Then 1-2 lines starting with "W:":
+W: <${lang.englishName} word> | <한글발음/읽기> | <한국어 뜻> | <short ${lang.englishName} example> | <한국어 예문뜻> | <ymin,xmin,ymax,xmax in 0-1000>`;
 }
 
 /**
- * Pass 1 (Fast Streaming with Hard Timeout & Non-Streaming Fallback):
- * Uses direct native fetch + ReadableStream.getReader() so mobile browsers never hang in SDK retries.
+ * Sub-10s Fast Single-Stream Tutor with 4.5s Hedged Tail-Latency Killer:
+ * - Uses `store: false`, `thinking_level: minimal/low`, `resolution: low`, `max_output_tokens: 260`.
+ * - Fires `onReplyReady` the moment the spoken reply finishes (even before `W:` cards complete) so TTS starts immediately.
+ * - If zero text tokens arrive within 4.5s (Free Tier tail-latency spike), races a parallel hedged `gemini-3.1-flash-lite`
+ *   unary request and immediately takes whichever answers first — enforcing a hard ~10s ceiling!
  */
 export async function streamTutorReply(
   params: AskTutorParams & {
     onPartial: (partial: ParsedStreamReply) => void;
+    onReplyReady?: (partial: ParsedStreamReply) => void;
     onStage?: (stage: string) => void;
   },
 ): Promise<StreamTutorResult> {
@@ -246,9 +240,10 @@ export async function streamTutorReply(
     audioBase64,
     audioMimeType = 'audio/wav',
     textQuestion,
-    previousInteractionId,
+    previousReplyContext,
     signal,
     onPartial,
+    onReplyReady,
     onStage,
   } = params;
 
@@ -259,11 +254,15 @@ export async function streamTutorReply(
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
   const startMs = performance.now();
 
+  const contextPrefix = previousReplyContext?.trim()
+    ? `Previous tutor reply: "${previousReplyContext.trim().slice(0, 140)}". `
+    : '';
+
   const promptText = audioBase64
-    ? `Answer the student's spoken question about this scene concisely.`
+    ? `${contextPrefix}Answer the user's spoken question about the image.`
     : textQuestion?.trim()
-      ? `Student question: "${textQuestion.trim()}". Answer concisely based on the scene.`
-      : `Identify the focal item in this image and teach its ${lang.englishName} expression and one quick useful phrase.`;
+      ? `${contextPrefix}User asks: "${textQuestion.trim()}". Answer briefly.`
+      : `Teach the main object in this image in ${lang.englishName} with 1 useful phrase.`;
 
   type InputBlock =
     | { type: 'text'; text: string }
@@ -292,13 +291,15 @@ export async function streamTutorReply(
     });
   }
 
-  const makePayload = (prevId: string | undefined, stream: boolean): Record<string, unknown> => ({
-    model: settings.tutorModel,
-    system_instruction: buildStreamingSystemInstruction(settings, Boolean(audioBase64)),
-    ...(prevId ? { previous_interaction_id: prevId } : {}),
+  const systemInstruction = buildFastSingleStreamInstruction(settings, Boolean(audioBase64));
+  const makePayload = (model: TutorModelId, stream: boolean): Record<string, unknown> => ({
+    model,
+    system_instruction: systemInstruction,
     input: inputBlocks,
+    store: false,
     generation_config: {
-      thinking_level: getFastThinkingLevel(settings.tutorModel),
+      thinking_level: getFastThinkingLevel(model),
+      max_output_tokens: 260,
     },
     stream,
   });
@@ -306,45 +307,30 @@ export async function streamTutorReply(
   const fallbackTranscript =
     textQuestion?.trim() || (audioBase64 ? '🎙️ 음성 질문' : '📸 이거 뭐예요?');
 
-  const runUnaryFallback = async (prevId?: string): Promise<StreamTutorResult> => {
-    onStage?.('⚡ 일반 모드로 재요청 중...');
-    const data = await fetchInteractionJson(settings.apiKey, makePayload(prevId, false), {
-      timeoutMs: 22000,
-      signal,
-    });
-    const rawText = extractTextFromInteractionObject(data);
-    if (!rawText.trim()) {
-      throw new Error('튜터 응답이 비어 있습니다.');
-    }
-    const parsed = parseStreamingReply(rawText);
-    onPartial(parsed);
-    const totalMs = Math.round(performance.now() - startMs);
-    return {
-      userTranscript: parsed.userTranscript || fallbackTranscript,
-      segments:
-        parsed.segments.length > 0
-          ? parsed.segments
-          : [{ text: parsed.plainText || rawText, isTarget: false }],
-      plainText: parsed.plainText || rawText,
-      interactionId: typeof data.id === 'string' ? data.id : undefined,
-      ttftMs: totalMs,
-      totalMs,
-    };
+  // Overall hard ceiling controller (10.5s max before first token, 15s total)
+  const primaryCtrl = new AbortController();
+  const hedgeCtrl = new AbortController();
+  let settled = false;
+  let gotFirstToken = false;
+  let firedReplyReady = false;
+
+  const linkExternal = () => {
+    primaryCtrl.abort();
+    hedgeCtrl.abort();
   };
+  if (signal) {
+    if (signal.aborted) {
+      linkExternal();
+    } else {
+      signal.addEventListener('abort', linkExternal, { once: true });
+    }
+  }
 
-  const runSse = async (prevId?: string): Promise<StreamTutorResult> => {
-    // 14s timeout waiting for HTTP response headers; once stream opens, extend to 25s and reset on any event
-    let timed = createTimedController(14000, signal);
-    let gotHeaders = false;
-    let gotFirstToken = false;
-
-    const resetStreamTimer = (ms = 25000) => {
-      timed.clear();
-      timed = createTimedController(ms, signal);
-    };
+  const runPrimarySse = async (): Promise<StreamTutorResult> => {
+    let timed = createTimedController(10500, primaryCtrl.signal);
 
     try {
-      onStage?.('📡 AI 서버에 장면 전송 중...');
+      onStage?.('📡 AI 서버 연결 중...');
       const res = await fetch(INTERACTIONS_ENDPOINT, {
         method: 'POST',
         headers: {
@@ -352,7 +338,7 @@ export async function streamTutorReply(
           Accept: 'text/event-stream',
           'x-goog-api-key': settings.apiKey.trim(),
         },
-        body: JSON.stringify(makePayload(prevId, true)),
+        body: JSON.stringify(makePayload(settings.tutorModel, true)),
         signal: timed.controller.signal,
       });
 
@@ -361,9 +347,7 @@ export async function streamTutorReply(
         throw new GeminiHttpError(res.status, extractApiErrorDetail(res.status, errText));
       }
 
-      gotHeaders = true;
-      resetStreamTimer(25000);
-      onStage?.('🧠 AI가 장면을 분석하는 중...');
+      if (!settled) onStage?.('🧠 장면 분석 중...');
 
       const contentType = (res.headers.get('content-type') || '').toLowerCase();
       if (!res.body || contentType.includes('application/json')) {
@@ -371,7 +355,13 @@ export async function streamTutorReply(
         const data = JSON.parse(jsonText) as Record<string, unknown>;
         const rawText = extractTextFromInteractionObject(data);
         const parsed = parseStreamingReply(rawText);
-        onPartial(parsed);
+        if (!settled) {
+          onPartial(parsed);
+          if (!firedReplyReady && parsed.plainText.trim()) {
+            firedReplyReady = true;
+            onReplyReady?.(parsed);
+          }
+        }
         const totalMs = Math.round(performance.now() - startMs);
         return {
           userTranscript: parsed.userTranscript || fallbackTranscript,
@@ -380,6 +370,7 @@ export async function streamTutorReply(
               ? parsed.segments
               : [{ text: parsed.plainText || rawText, isTarget: false }],
           plainText: parsed.plainText || rawText,
+          inlineCards: parsed.inlineCards,
           interactionId: typeof data.id === 'string' ? data.id : undefined,
           ttftMs: totalMs,
           totalMs,
@@ -392,7 +383,12 @@ export async function streamTutorReply(
       let accumulated = '';
       let ttftMs = 0;
       let completedId: string | undefined;
-      let latestParsed: ParsedStreamReply = { segments: [], plainText: '' };
+      let latestParsed: ParsedStreamReply = {
+        segments: [],
+        plainText: '',
+        replyReady: false,
+        inlineCards: [],
+      };
 
       const processFrameData = (rawData: string): boolean => {
         if (rawData === '[DONE]') return true;
@@ -403,9 +399,6 @@ export async function streamTutorReply(
           return false;
         }
 
-        // Any valid SSE frame proves the server is alive — refresh idle timeout
-        resetStreamTimer(25000);
-
         if (ev.event_type === 'error') {
           const errObj = ev.error as Record<string, unknown> | undefined;
           throw new Error(
@@ -413,24 +406,23 @@ export async function streamTutorReply(
           );
         }
 
-        if (ev.event_type === 'step.start') {
-          const step = ev.step as Record<string, unknown> | undefined;
-          if (step?.type === 'thought') {
-            onStage?.('🧠 AI가 생각 정리 중...');
-          } else if (step?.type === 'model_output') {
-            onStage?.('💬 답변 생성 중...');
-          }
-        }
-
         const deltaText = extractEventTextDelta(ev);
-        if (deltaText) {
+        if (deltaText && !settled) {
           if (!gotFirstToken) {
             gotFirstToken = true;
             ttftMs = Math.round(performance.now() - startMs);
+            // Primary won! Cancel any hedged backup immediately and extend read window
+            hedgeCtrl.abort();
+            timed.clear();
+            timed = createTimedController(10000, primaryCtrl.signal);
           }
           accumulated += deltaText;
           latestParsed = parseStreamingReply(accumulated);
           onPartial(latestParsed);
+          if (latestParsed.replyReady && !firedReplyReady && latestParsed.plainText.trim()) {
+            firedReplyReady = true;
+            onReplyReady?.(latestParsed);
+          }
         }
 
         if (ev.event_type === 'interaction.completed') {
@@ -438,9 +430,11 @@ export async function streamTutorReply(
           if (typeof interaction?.id === 'string') {
             completedId = interaction.id;
           }
-          if (!accumulated.trim()) {
+          if (!accumulated.trim() && !settled) {
             const fallbackText = extractCompletedFallbackText(ev);
             if (fallbackText) {
+              gotFirstToken = true;
+              hedgeCtrl.abort();
               accumulated = fallbackText;
               latestParsed = parseStreamingReply(accumulated);
               onPartial(latestParsed);
@@ -491,17 +485,14 @@ export async function streamTutorReply(
             ? latestParsed.segments
             : [{ text: latestParsed.plainText, isTarget: false }],
         plainText: latestParsed.plainText,
+        inlineCards: latestParsed.inlineCards,
         interactionId: completedId,
         ttftMs: ttftMs || totalMs,
         totalMs,
       };
     } catch (err) {
-      if (signal?.aborted) {
-        throw err;
-      }
-      // Only fall back to unary if SSE stalled before headers or before any text arrived
-      if (timed.didTimeout() && (!gotHeaders || !gotFirstToken)) {
-        return runUnaryFallback(prevId);
+      if (timed.didTimeout() && !signal?.aborted) {
+        throw new Error('응답 시간 초과 (10초) — 다시 스캔해 주세요.');
       }
       throw err;
     } finally {
@@ -509,30 +500,125 @@ export async function streamTutorReply(
     }
   };
 
+  const runHedgedFastBackup = async (): Promise<StreamTutorResult> => {
+    // Wait 4.5s before hedging so normal fast calls only ever spend 1 API request
+    await new Promise<void>((resolve, reject) => {
+      const tid = window.setTimeout(resolve, 4500);
+      const onAbort = () => {
+        window.clearTimeout(tid);
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      if (hedgeCtrl.signal.aborted) {
+        onAbort();
+      } else {
+        hedgeCtrl.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+
+    if (gotFirstToken || settled || hedgeCtrl.signal.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    onStage?.('⚡ 초고속 예비 경로 가동 중...');
+    const data = await fetchInteractionJson(
+      settings.apiKey,
+      makePayload('gemini-3.1-flash-lite', false),
+      { timeoutMs: 6500, signal: hedgeCtrl.signal },
+    );
+
+    if (gotFirstToken || settled) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+
+    const rawText = extractTextFromInteractionObject(data);
+    if (!rawText.trim()) {
+      throw new Error('튜터 응답이 비어 있습니다.');
+    }
+    const parsed = parseStreamingReply(rawText);
+    const totalMs = Math.round(performance.now() - startMs);
+    onPartial(parsed);
+    return {
+      userTranscript: parsed.userTranscript || fallbackTranscript,
+      segments:
+        parsed.segments.length > 0
+          ? parsed.segments
+          : [{ text: parsed.plainText || rawText, isTarget: false }],
+      plainText: parsed.plainText || rawText,
+      inlineCards: parsed.inlineCards,
+      interactionId: typeof data.id === 'string' ? data.id : undefined,
+      ttftMs: totalMs,
+      totalMs,
+    };
+  };
+
   try {
-    return await runSse(previousInteractionId?.trim() || undefined);
+    // Race primary SSE against 4.5s-delayed hedged fast backup; first success wins!
+    const primaryPromise = runPrimarySse();
+    const hedgePromise = runHedgedFastBackup();
+
+    const result = await new Promise<StreamTutorResult>((resolve, reject) => {
+      let primaryErr: unknown = null;
+      let hedgeErr: unknown = null;
+      let primaryDone = false;
+      let hedgeDone = false;
+
+      const finishWin = (res: StreamTutorResult, winner: 'primary' | 'hedge') => {
+        if (settled) return;
+        settled = true;
+        if (winner === 'primary') hedgeCtrl.abort();
+        else primaryCtrl.abort();
+        resolve(res);
+      };
+
+      const checkBothFailed = () => {
+        if (!settled && primaryDone && hedgeDone) {
+          settled = true;
+          reject(primaryErr || hedgeErr || new Error('응답을 받지 못했습니다.'));
+        }
+      };
+
+      primaryPromise.then(
+        (res) => finishWin(res, 'primary'),
+        (err) => {
+          primaryDone = true;
+          primaryErr = err;
+          // If primary failed immediately with auth/rate-limit/400 error, don't wait 4.5s for hedge
+          if (err instanceof GeminiHttpError && (err.status === 400 || err.status === 401 || err.status === 403 || err.status === 429)) {
+            hedgeCtrl.abort();
+            settled = true;
+            reject(err);
+            return;
+          }
+          checkBothFailed();
+        },
+      );
+
+      hedgePromise.then(
+        (res) => finishWin(res, 'hedge'),
+        (err) => {
+          hedgeDone = true;
+          hedgeErr = err;
+          checkBothFailed();
+        },
+      );
+    });
+
+    return result;
   } catch (err) {
     if (signal?.aborted) {
       throw err;
     }
-    if (
-      previousInteractionId?.trim() &&
-      err instanceof GeminiHttpError &&
-      (err.status === 400 || err.status === 404)
-    ) {
-      try {
-        return await runSse(undefined);
-      } catch (retryErr) {
-        throw new Error(formatGeminiError(retryErr));
-      }
-    }
     throw new Error(formatGeminiError(err));
+  } finally {
+    settled = true;
+    primaryCtrl.abort();
+    hedgeCtrl.abort();
+    signal?.removeEventListener('abort', linkExternal);
   }
 }
 
 /**
- * Pass 2 (Background Non-Blocking): Uses ultra-fast gemini-3.5-flash-lite with minimal thinking
- * to extract 1-3 sticker vocabulary cards + bounding boxes while Pass 1 TTS is already playing.
+ * Fallback Pass 2 (only called if Pass 1 didn't emit inline `W:` cards).
  */
 export async function extractVocabCardsAsync(params: {
   settings: AppSettings;
@@ -560,7 +646,7 @@ export async function extractVocabCardsAsync(params: {
   const inputBlocks: InputBlock[] = [
     {
       type: 'text',
-      text: `Tutor taught this ${lang.englishName} lesson:\n"${replyText}"\n\nExtract 1 to 3 key ${lang.englishName} vocabulary cards matching what was taught and visible in the image. For \`reading\`, provide ${lang.readingGuideInstruction}. Populate \`box2d\` as [ymin, xmin, ymax, xmax] normalized 0-1000 around each object.`,
+      text: `Tutor taught:\n"${replyText}"\nExtract 1-2 ${lang.englishName} vocabCards with ${lang.readingGuideInstruction} and [ymin,xmin,ymax,xmax] 0-1000 box2d.`,
     },
   ];
 
@@ -569,7 +655,7 @@ export async function extractVocabCardsAsync(params: {
       type: 'image',
       data: imageBase64,
       mime_type: imageMimeType,
-      resolution: 'medium',
+      resolution: 'low',
     });
   }
 
@@ -577,7 +663,7 @@ export async function extractVocabCardsAsync(params: {
     const data = await fetchInteractionJson(
       settings.apiKey,
       {
-        model: 'gemini-3.5-flash-lite',
+        model: 'gemini-3.1-flash-lite',
         input: inputBlocks,
         store: false,
         response_format: {
@@ -587,9 +673,10 @@ export async function extractVocabCardsAsync(params: {
         },
         generation_config: {
           thinking_level: 'minimal',
+          max_output_tokens: 280,
         },
       },
-      { timeoutMs: 12000, signal },
+      { timeoutMs: 8000, signal },
     );
 
     const rawText = extractTextFromInteractionObject(data);
@@ -608,7 +695,6 @@ export async function askTutor({
   audioBase64,
   audioMimeType = 'audio/wav',
   textQuestion,
-  previousInteractionId,
   signal,
 }: AskTutorParams): Promise<AskTutorResult> {
   if (!settings.apiKey.trim()) {
@@ -618,10 +704,10 @@ export async function askTutor({
   const lang = TARGET_LANGUAGES[settings.targetLanguage];
 
   const promptText = audioBase64
-    ? `Listen to the student's spoken question (which may mix Korean and ${lang.englishName}) about this scene, answer concisely as the tutor, and extract 1-3 vocabulary cards with bounding boxes.`
+    ? `Answer the user's spoken question about this scene concisely.`
     : textQuestion?.trim()
-      ? `Student question: "${textQuestion.trim()}". Answer concisely as the tutor based on the scene and extract 1-3 vocabulary cards with bounding boxes.`
-      : `Identify the main focal object, menu item, or sign in this image. Teach its ${lang.englishName} name, natural pronunciation, and one quick practical phrase for using it in real life.`;
+      ? `User asks: "${textQuestion.trim()}". Answer concisely.`
+      : `Identify the main object in this image and teach its ${lang.englishName} name and 1 useful phrase.`;
 
   const inputBlocks: Record<string, unknown>[] = [{ type: 'text', text: promptText }];
   if (imageBase64) {
@@ -640,40 +726,25 @@ export async function askTutor({
     });
   }
 
-  const runCreate = (prevId?: string) =>
-    fetchInteractionJson(
-      settings.apiKey,
-      {
-        model: settings.tutorModel,
-        system_instruction: buildSystemInstruction(settings),
-        ...(prevId ? { previous_interaction_id: prevId } : {}),
-        input: inputBlocks,
-        response_format: {
-          type: 'text',
-          mime_type: 'application/json',
-          schema: TUTOR_RESPONSE_JSON_SCHEMA,
-        },
-        generation_config: {
-          thinking_level: getFastThinkingLevel(settings.tutorModel),
-        },
+  const data = await fetchInteractionJson(
+    settings.apiKey,
+    {
+      model: settings.tutorModel,
+      system_instruction: buildSystemInstruction(settings),
+      input: inputBlocks,
+      store: false,
+      response_format: {
+        type: 'text',
+        mime_type: 'application/json',
+        schema: TUTOR_RESPONSE_JSON_SCHEMA,
       },
-      { timeoutMs: 14000, signal },
-    );
-
-  let data: Record<string, unknown>;
-  try {
-    data = await runCreate(previousInteractionId?.trim() || undefined);
-  } catch (err) {
-    if (
-      previousInteractionId?.trim() &&
-      err instanceof GeminiHttpError &&
-      (err.status === 400 || err.status === 404)
-    ) {
-      data = await runCreate(undefined);
-    } else {
-      throw new Error(formatGeminiError(err));
-    }
-  }
+      generation_config: {
+        thinking_level: getFastThinkingLevel(settings.tutorModel),
+        max_output_tokens: 340,
+      },
+    },
+    { timeoutMs: 10000, signal },
+  );
 
   const rawText = extractTextFromInteractionObject(data);
   if (!rawText) {
@@ -693,7 +764,7 @@ export async function askTutor({
 
 /**
  * Streams raw 16-bit signed LE mono PCM audio chunks (default 24kHz) directly via native fetch
- * with an 8-second first-chunk timeout so TTS never hangs silently.
+ * with a snappy 3.5-second first-chunk timeout so slow Free Tier TTS falls back immediately to browser speech.
  */
 export async function* streamGeminiTtsChunks(params: {
   apiKey: string;
@@ -704,7 +775,7 @@ export async function* streamGeminiTtsChunks(params: {
 }): AsyncGenerator<{ pcmBytes: Uint8Array; sampleRate: number }> {
   const personaCfg = PERSONAS[params.persona];
   const model = params.expressive ? 'gemini-3.8-flash-tts' : 'gemini-3.8-flash-lite-tts';
-  let timed = createTimedController(8000, params.signal);
+  let timed = createTimedController(3500, params.signal);
   let gotFirstChunk = false;
 
   try {
@@ -717,6 +788,7 @@ export async function* streamGeminiTtsChunks(params: {
       },
       body: JSON.stringify({
         model,
+        store: false,
         input: [
           {
             type: 'user_input',
@@ -812,6 +884,7 @@ export async function synthesizeGeminiTts(params: {
     params.apiKey,
     {
       model,
+      store: false,
       input: [
         {
           type: 'user_input',
@@ -834,7 +907,7 @@ export async function synthesizeGeminiTts(params: {
         speech_config: [{ voice: personaCfg.geminiVoice }],
       },
     },
-    { timeoutMs: 12000 },
+    { timeoutMs: 8000 },
   );
 
   const audioObj = extractAudioFromInteractionObject(data);
@@ -858,18 +931,19 @@ export async function verifyGeminiApiKey(apiKey: string): Promise<{ ok: boolean;
     const data = await fetchInteractionJson(
       apiKey,
       {
-        model: 'gemini-3.5-flash-lite',
+        model: 'gemini-3.1-flash-lite',
         input: 'Reply with OK.',
         store: false,
         generation_config: {
           thinking_level: 'minimal',
+          max_output_tokens: 16,
         },
       },
       { timeoutMs: 8000 },
     );
     const out = extractTextFromInteractionObject(data);
     if (out || data.id) {
-      return { ok: true, message: '연결 성공! Gemini 초고속 튜터를 사용할 수 있습니다.' };
+      return { ok: true, message: '연결 성공! Gemini 3.1 초고속 튜터를 사용할 수 있습니다.' };
     }
     return { ok: false, message: '응답을 받지 못했습니다.' };
   } catch (err) {
